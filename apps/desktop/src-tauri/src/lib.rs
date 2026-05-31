@@ -50,6 +50,7 @@ const CC_SWITCH_KEY: &str = "cc-switch.config";
 const ROUTER_KEY_CLAUDE: &str = "router.claude";
 const ROUTER_KEY_CODEX: &str = "router.codex";
 const ASSISTANT_AI_KEY: &str = "assistant-ai.config";
+const AGENT_INTERACTION_KEY: &str = "agent-interaction.config";
 /// 「添加项目 → 从 GitHub clone」时默认 clone 到的父目录。
 const PROJECT_CLONE_PARENT_KEY: &str = "project.cloneParentDir";
 
@@ -128,6 +129,15 @@ struct ChatModelOption {
     id: String,
     label: String,
     backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AgentInteractionSettings {
+    #[serde(default)]
+    non_interrupt_mode: bool,
+    #[serde(default)]
+    debug: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1031,6 +1041,15 @@ fn load_assistant_ai_config(app: &AppHandle) -> AssistantAIConfig {
     read().unwrap_or_default()
 }
 
+fn load_agent_interaction_settings(app: &AppHandle) -> AgentInteractionSettings {
+    let read = || -> Option<AgentInteractionSettings> {
+        let store = app.store(PROVIDER_STORE_FILE).ok()?;
+        let value = store.get(AGENT_INTERACTION_KEY)?;
+        serde_json::from_value::<AgentInteractionSettings>(value).ok()
+    };
+    read().unwrap_or_default()
+}
+
 /// 读某个 backend 的路由模式；未设置返回默认 "cc-switch"。
 fn load_router_mode(app: &AppHandle, backend: &str) -> String {
     let key = match backend {
@@ -1326,7 +1345,7 @@ fn spawn_agent_turn(
                 };
                 log_agent_event_effect(event_host.dispatch(&event_ctx, &event));
                 match &event {
-                    AgentRuntimeEvent::ToolUse { .. } => {}
+                    AgentRuntimeEvent::ToolUse { .. } | AgentRuntimeEvent::TodoList { .. } => {}
                     AgentRuntimeEvent::Timeline { .. } => {
                         if let Some(input) =
                             timeline_input_from_runtime_event(&event_ctx, &event)
@@ -2014,6 +2033,25 @@ fn assistant_ai_set_config(app: AppHandle, config: AssistantAIConfig) -> Result<
     Ok(())
 }
 
+#[tauri::command]
+fn agent_interaction_get_settings(app: AppHandle) -> AgentInteractionSettings {
+    load_agent_interaction_settings(&app)
+}
+
+#[tauri::command]
+fn agent_interaction_set_settings(
+    app: AppHandle,
+    settings: AgentInteractionSettings,
+) -> Result<(), String> {
+    let store = app
+        .store(PROVIDER_STORE_FILE)
+        .map_err(|e| format!("打开配置存储失败：{e}"))?;
+    let value = serde_json::to_value(&settings).map_err(|e| e.to_string())?;
+    store.set(AGENT_INTERACTION_KEY, value);
+    store.save().map_err(|e| format!("保存配置失败：{e}"))?;
+    Ok(())
+}
+
 /// 连通性 ping：GET {baseUrl}/models，3 秒超时。
 /// 不消耗 token，能同时验证 baseUrl 可达、apiKey 被接受、配置的 model 是否在列表里。
 #[tauri::command]
@@ -2403,6 +2441,8 @@ pub fn run() {
             assistant_ai_get_config,
             assistant_ai_set_config,
             assistant_ai_test_connection,
+            agent_interaction_get_settings,
+            agent_interaction_set_settings,
             router_get_mode,
             router_set_mode,
             project_get_settings,

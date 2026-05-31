@@ -4,8 +4,10 @@ import {
   mockInvoke,
 } from "./tauriMock";
 import {
+  getAgentInteractionSettings,
   onAskUserRequest,
   respondAskUser,
+  setAgentInteractionSettings,
   type AgentAskUserRequest,
 } from "../src/services/chat";
 
@@ -62,5 +64,19 @@ describe("chat AskUser bridge service", () => {
         },
       },
     }, undefined);
+  });
+
+  it("Agent 交互设置默认关闭，并能保存非打断模式", async () => {
+    await expect(getAgentInteractionSettings()).resolves.toEqual({
+      nonInterruptMode: false,
+      debug: false,
+    });
+
+    await setAgentInteractionSettings({ nonInterruptMode: true });
+
+    await expect(getAgentInteractionSettings()).resolves.toEqual({
+      nonInterruptMode: true,
+      debug: false,
+    });
   });
 });

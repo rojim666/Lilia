@@ -117,6 +117,7 @@ let tasks: TaskRow[] = [];
 let timelineEvents: Record<string, AgentTimelineEvent[]> = {};
 let chatRunning: Record<string, boolean> = {};
 let chatQueued: Record<string, Array<Record<string, unknown>>> = {};
+let agentInteractionSettings = { nonInterruptMode: false, debug: false };
 let eventHandlers: Record<string, Array<(event: { payload: unknown }) => void>> = {};
 let webviewDragDropHandlers: Array<(event: { payload: unknown }) => void> = [];
 let projectPinUpdater: ((projectId: string, pinned: boolean) => void) | null = null;
@@ -162,6 +163,7 @@ export function resetTauriMockData() {
   };
   chatRunning = {};
   chatQueued = {};
+  agentInteractionSettings = { nonInterruptMode: false, debug: false };
   eventHandlers = {};
   webviewDragDropHandlers = [];
   refreshSessionCounts();
@@ -589,6 +591,21 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
 
     case "chat_set_composer_state":
       return undefined;
+
+    case "agent_interaction_get_settings":
+      return { ...agentInteractionSettings };
+
+    case "agent_interaction_set_settings": {
+      const settings = args.settings as {
+        nonInterruptMode?: unknown;
+        debug?: unknown;
+      } | undefined;
+      agentInteractionSettings = {
+        nonInterruptMode: settings?.nonInterruptMode === true,
+        debug: settings?.debug === true,
+      };
+      return undefined;
+    }
 
     case "chat_list_models": {
       const backend = String(args.backend || "claude");

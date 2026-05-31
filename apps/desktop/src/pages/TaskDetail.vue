@@ -25,9 +25,18 @@ import ChatTranscript from "../components/chat/ChatTranscript.vue";
 import ChatComposer from "../components/chat/ChatComposer.vue";
 import ChatSidebarHost from "../components/chat/ChatSidebarHost.vue";
 import TodoFloat from "../components/todo/TodoFloat.vue";
-import { resolveAskUser, useAskUserForTask } from "../composables/useAskUser";
+import {
+  resolveAskUserById,
+  useAskUserForTask,
+  usePendingAsksForTask,
+} from "../composables/useAskUser";
+import {
+  usePendingAgentActionsForTask,
+  type PendingAgentActionResolution,
+} from "../composables/usePendingAgentActions";
 import {
   respondConsent,
+  usePendingToolConsentsForTask,
   useToolConsentForTask,
 } from "../composables/useToolConsentBridge";
 import {
@@ -44,6 +53,12 @@ import {
   setComposerState,
   type ToolConsentDecision,
 } from "../services/chat";
+import {
+  loadAgentInteractionSettings,
+  useAgentInteractionSettings,
+} from "../composables/useAgentInteractionSettings";
+import { onDebugTimelineEvent } from "../composables/useDebugTimelineEvents";
+import { registerDebugChatSidebarPanel } from "../composables/useDebugChatSidebarPanel";
 import type {
   AskUserResult,
   AgentTimelineEvent,
@@ -72,7 +87,11 @@ const emptyHeadline = computed(() =>
     : "今天想做什么？",
 );
 
-const timelineEvents = shallowRef<AgentTimelineEvent[]>([]);
+const persistedTimelineEvents = shallowRef<AgentTimelineEvent[]>([]);
+const overlayTimelineEvents = shallowRef<AgentTimelineEvent[]>([]);
+const timelineEvents = computed(() =>
+  mergeTimelineEvents(persistedTimelineEvents.value, overlayTimelineEvents.value),
+);
 const composer = ref<ChatComposerState>({
   taskId: props.taskId,
   backend: "claude",
@@ -86,10 +105,23 @@ const chatPageRef = ref<HTMLElement | null>(null);
 const attachments = ref<ChatAttachment[]>([]);
 const userSendScrollKey = ref(0);
 const pendingAskUser = useAskUserForTask(() => props.taskId);
+const pendingAskUsers = usePendingAsksForTask(() => props.taskId);
 const pendingToolConsent = useToolConsentForTask(() => props.taskId);
+const pendingToolConsents = usePendingToolConsentsForTask(() => props.taskId);
+const runtimePendingAgentActions = usePendingAgentActionsForTask(
+  pendingAskUsers,
+  pendingToolConsents,
+);
+const agentInteractionSettings = useAgentInteractionSettings();
+const nonInterruptMode = agentInteractionSettings.nonInterruptMode;
+const pendingAgentActions = computed(() =>
+  nonInterruptMode.value ? runtimePendingAgentActions.value : [],
+);
 
 const pendingPlanApproval = computed(() => {
-  const ask = pendingAskUser.value;
+  const ask = nonInterruptMode.value
+    ? pendingAskUsers.value.find((item) => item.spec.intent === "plan_approval") ?? null
+    : pendingAskUser.value;
   if (!ask) return null;
   if (ask.spec.intent !== "plan_approval") return null;
   const question = ask.spec.questions[0];
@@ -242,7 +274,9 @@ async function onInterrupt() {
 }
 
 function onResolveAskUser(result: AskUserResult) {
-  resolveAskUser(result);
+  const ask = pendingAskUser.value;
+  if (!ask) return;
+  resolveAskUserById(ask.id, result);
 }
 
 async function onResolveToolConsent(
@@ -256,6 +290,27 @@ async function onResolveToolConsent(
   } catch (err) {
     console.error("[tool-consent] respond failed", err);
   }
+}
+
+async function onResolvePendingAgentAction(resolution: PendingAgentActionResolution) {
+  if (resolution.kind === "tool_consent") {
+    const request = pendingToolConsents.value.find(
+      (item) => item.requestId === resolution.requestId,
+    );
+    if (!request) return;
+    try {
+      await respondConsent(
+        request.taskId,
+        request.requestId,
+        resolution.decision,
+        resolution.message,
+      );
+    } catch (err) {
+      console.error("[tool-consent] respond failed", err);
+    }
+    return;
+  }
+  resolveAskUserById(resolution.askId, resolution.result);
 }
 
 async function onComposerUpdate(next: ChatComposerState) {
@@ -283,21 +338,36 @@ async function reloadModelsForBackend(backend: ChatComposerState["backend"]) {
 }
 
 function upsertTimelineEvent(event: AgentTimelineEvent) {
-  const existingIndex = timelineEvents.value.findIndex((item) => item.id === event.id);
-  if (existingIndex < 0) {
-    const next: AgentTimelineEvent[] = timelineEvents.value.slice();
-    next.push(event);
-    timelineEvents.value = next;
-    return;
-  }
+  persistedTimelineEvents.value = upsertTimelineEventById(
+    persistedTimelineEvents.value,
+    event,
+  );
+}
 
-  const next: AgentTimelineEvent[] = timelineEvents.value.slice();
+function upsertOverlayTimelineEvent(event: AgentTimelineEvent) {
+  overlayTimelineEvents.value = upsertTimelineEventById(
+    overlayTimelineEvents.value,
+    event,
+  );
+}
+
+function upsertTimelineEventById(
+  events: AgentTimelineEvent[],
+  event: AgentTimelineEvent,
+): AgentTimelineEvent[] {
+  const existingIndex = events.findIndex((item) => item.id === event.id);
+  if (existingIndex < 0) {
+    return [...events, event];
+  }
+  const next = events.slice();
   next[existingIndex] = event;
-  timelineEvents.value = next;
+  return next;
 }
 
 function removeTimelineEvent(eventId: string) {
-  timelineEvents.value = timelineEvents.value.filter((item) => item.id !== eventId);
+  persistedTimelineEvents.value = persistedTimelineEvents.value.filter((item) =>
+    item.id !== eventId
+  );
 }
 
 function attachmentsToTimelinePayload(attachments: ChatAttachment[]): AgentTimelinePayload[] {
@@ -399,13 +469,32 @@ async function loadAll() {
     getComposerState(taskId),
   ]);
   if (seq !== loadSeq || taskId !== props.taskId || projectId !== props.projectId) return;
-  timelineEvents.value = mergeTimelineEvents(events, timelineEvents.value);
+  persistedTimelineEvents.value = mergeTimelineEvents(events, persistedTimelineEvents.value);
   composer.value = comp;
   // models 依赖 backend，单独拉。
   await reloadModelsForBackend(comp.backend);
 }
 
 const unlisteners: UnlistenFn[] = [];
+let unsubscribeDebugTimeline: (() => void) | null = null;
+let unregisterDebugPanel: (() => void) | null = null;
+
+function syncDebugPanelRegistration() {
+  if (!hasContext.value || !agentInteractionSettings.debug.value) {
+    unregisterDebugPanel?.();
+    unregisterDebugPanel = null;
+    return;
+  }
+  if (unregisterDebugPanel) return;
+  unregisterDebugPanel = registerDebugChatSidebarPanel();
+}
+
+function resubscribeDebugTimeline() {
+  unsubscribeDebugTimeline?.();
+  unsubscribeDebugTimeline = onDebugTimelineEvent(props.taskId, upsertOverlayTimelineEvent);
+}
+
+resubscribeDebugTimeline();
 
 onMounted(async () => {
   unlisteners.push(
@@ -427,7 +516,7 @@ onMounted(async () => {
       if (e.taskId !== props.taskId) return;
       isTurnRunning.value = true;
       let cleared = false;
-      timelineEvents.value = timelineEvents.value.map((event) => {
+      persistedTimelineEvents.value = persistedTimelineEvents.value.map((event) => {
         const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
           ? event.payload as Record<string, unknown>
           : {};
@@ -450,10 +539,14 @@ onMounted(async () => {
       isTurnRunning.value = false;
     }),
   );
-  await Promise.all([loadAll()]);
+  await Promise.all([loadAll(), loadAgentInteractionSettings()]);
 });
 
 onUnmounted(async () => {
+  unsubscribeDebugTimeline?.();
+  unsubscribeDebugTimeline = null;
+  unregisterDebugPanel?.();
+  unregisterDebugPanel = null;
   for (const u of unlisteners) {
     try { await u(); } catch { /* ignore */ }
   }
@@ -464,10 +557,18 @@ watch(
   () => [props.projectId, props.taskId] as const,
   async () => {
     isTurnRunning.value = false;
-    timelineEvents.value = [];
+    persistedTimelineEvents.value = [];
+    overlayTimelineEvents.value = [];
     attachments.value = [];
+    resubscribeDebugTimeline();
     await loadAll();
   },
+);
+
+watch(
+  () => [hasContext.value, agentInteractionSettings.debug.value] as const,
+  syncDebugPanelRegistration,
+  { immediate: true },
 );
 </script>
 
@@ -487,6 +588,9 @@ watch(
             :project-cwd="project?.cwd ?? null"
             :active-plan-approval-turn-id="pendingPlanApproval?.turnId ?? null"
             :force-scroll-bottom-key="userSendScrollKey"
+            :pending-agent-actions="pendingAgentActions"
+            :show-expired-pending-actions="nonInterruptMode"
+            @resolve-pending-agent-action="onResolvePendingAgentAction"
           >
             <template #controls>
               <div class="chat-controls">
@@ -495,8 +599,8 @@ watch(
                   :state="composer"
                   :attachments="attachments"
                   :sending="isTurnRunning"
-                  :pending-ask="pendingAskUser"
-                  :tool-consent="pendingToolConsent"
+                  :pending-ask="nonInterruptMode ? null : pendingAskUser"
+                  :tool-consent="nonInterruptMode ? null : pendingToolConsent"
                   @send="onSend"
                   @interrupt="onInterrupt"
                   @update:state="onComposerUpdate"
