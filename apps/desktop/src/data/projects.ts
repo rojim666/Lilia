@@ -28,7 +28,7 @@ export function registerProjectRemovalHandler(
   onProjectRemoved = handler;
 }
 
-async function refresh(): Promise<void> {
+export async function refresh(): Promise<void> {
   const rows = await invoke<ProjectRow[]>("project_list");
   PROJECTS.value = rows.map((r) => ({
     id: r.id,
