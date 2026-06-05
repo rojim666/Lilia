@@ -1,17 +1,18 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
-import { RouterLink, useRoute, useRouter } from "vue-router";
+import { computed, nextTick, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import {
+  Archive,
+  Code2,
   Folder,
   FolderOpen,
   LayoutGrid,
+  MessageSquarePlus,
   MoreHorizontal,
-  Plus,
   Pencil,
-  Archive,
-  Trash2,
-  Code2,
   Pin,
+  Plus,
+  Trash2,
 } from "lucide-vue-next";
 import type { Project, Task } from "@lilia/contracts";
 import { vContextMenu } from "../../directives/contextMenu";
@@ -27,38 +28,24 @@ import {
 } from "../../services/projectsStore";
 import {
   archiveTask,
+  isProjectTasksLoaded,
   listProjectConversations,
-  toggleTaskPin,
 } from "../../services/tasksStore";
+import type {
+  TreeDragKind,
+  TreeDragSource,
+  TreeDropTarget,
+} from "../../composables/useSidebarTreeDrag";
 import { openInFileManager, openInVSCode } from "../../services/projects";
+import { openPopupNewChat } from "../../services/popupWindows";
+import SidebarTaskRow from "./SidebarTaskRow.vue";
 
-type TreeDragKind = "project" | "task";
-type TreeDropPosition = "before" | "after" | "inside";
-
-interface TreeDragMarker {
-  kind: TreeDragKind;
-  active: boolean;
-  projectId: string | null;
-  taskId: string | null;
-}
-
-interface TreeDropMarker {
-  kind: "project" | "task" | "orphans";
-  projectId: string | null;
-  taskId: string | null;
-  position: TreeDropPosition;
-  valid: boolean;
-}
-
-const props = withDefaults(defineProps<{
+const props = defineProps<{
   project: Project;
   isExpanded: boolean;
-  dragSource?: TreeDragMarker | null;
-  dropTarget?: TreeDropMarker | null;
-  treeActivityToken?: number;
-}>(), {
-  treeActivityToken: 0,
-});
+  dragSource?: TreeDragSource | null;
+  dropTarget?: TreeDropTarget | null;
+}>();
 
 const emit = defineEmits<{
   toggle: [projectId: string];
@@ -72,19 +59,17 @@ const route = useRoute();
 const router = useRouter();
 
 const PROJECT_CONVERSATION_COLLAPSE_LIMIT = 4;
-const PROJECT_CONVERSATION_IDLE_MS = 30_000;
 
 const editingId = ref<string | null>(null);
 const editingValue = ref("");
 const editingInput = ref<HTMLInputElement | null>(null);
 
-const confirmingId = ref<string | null>(null);
 const overflowExpanded = ref(false);
-let overflowCollapseTimer: ReturnType<typeof window.setTimeout> | null = null;
 
 const projectConversations = computed(() =>
   listProjectConversations(props.project.id)
 );
+const projectTasksLoaded = computed(() => isProjectTasksLoaded(props.project.id));
 
 const activeTaskId = computed(() => {
   const taskId = route.params.taskId;
@@ -122,34 +107,13 @@ const showConversationOverflow = computed(() =>
   visibleProjectConversations.value.length < projectConversations.value.length
 );
 
-function clearOverflowCollapseTimer() {
-  if (overflowCollapseTimer === null) return;
-  window.clearTimeout(overflowCollapseTimer);
-  overflowCollapseTimer = null;
-}
-
 function collapseConversationOverflow() {
   overflowExpanded.value = false;
-  clearOverflowCollapseTimer();
-}
-
-function scheduleOverflowCollapse() {
-  clearOverflowCollapseTimer();
-  if (!overflowExpanded.value || !props.isExpanded) return;
-  overflowCollapseTimer = window.setTimeout(() => {
-    collapseConversationOverflow();
-  }, PROJECT_CONVERSATION_IDLE_MS);
 }
 
 function revealConversationOverflow() {
   overflowExpanded.value = true;
-  scheduleOverflowCollapse();
 }
-
-watch(
-  () => props.treeActivityToken,
-  scheduleOverflowCollapse,
-);
 
 watch(
   () => props.isExpanded,
@@ -168,44 +132,6 @@ watch(
     }
   },
 );
-
-onBeforeUnmount(() => {
-  clearOverflowCollapseTimer();
-});
-
-async function onArchiveClick(e: MouseEvent, taskId: string) {
-  e.preventDefault();
-  e.stopPropagation();
-  if (confirmingId.value === taskId) {
-    try {
-      const archived = await archiveTask(taskId);
-      confirmingId.value = null;
-      if (archived && isActiveTask(taskId)) {
-        emit("archived");
-      }
-    } catch (err) {
-      confirmingId.value = null;
-      emit("error", `归档对话失败：${String(err)}`);
-    }
-  } else {
-    confirmingId.value = taskId;
-  }
-}
-
-async function onTaskPinClick(e: MouseEvent, taskId: string) {
-  e.preventDefault();
-  e.stopPropagation();
-  try {
-    await toggleTaskPin(taskId);
-  } catch (err) {
-    emit("error", `切换对话置顶失败：${String(err)}`);
-  }
-}
-
-function onRowLeave() {
-  confirmingId.value = null;
-}
-
 async function startRename() {
   editingId.value = props.project.id;
   editingValue.value = props.project.name;
@@ -290,8 +216,42 @@ async function deleteProject() {
   }
 }
 
+async function openProjectChatInPopup() {
+  try {
+    await openPopupNewChat(props.project.id);
+  } catch (err) {
+    emit("error", `创建弹出窗口对话失败：${String(err)}`);
+  }
+}
+
+function onProjectAuxClick(e: MouseEvent) {
+  if (e.button !== 1) return;
+  e.preventDefault();
+  e.stopPropagation();
+  void openProjectChatInPopup();
+}
+
 function isActiveTask(taskId: string) {
   return route.path === `/projects/${props.project.id}/tasks/${taskId}`;
+}
+
+function onTaskArchived(taskId: string) {
+  if (isActiveTask(taskId)) emit("archived");
+}
+
+async function archiveProjectTask(taskId: string): Promise<boolean> {
+  try {
+    const archived = await archiveTask(taskId);
+    if (archived) onTaskArchived(taskId);
+    return archived;
+  } catch (err) {
+    emit("error", `归档对话失败：${String(err)}`);
+    return false;
+  }
+}
+
+function openTask(taskId: string) {
+  void router.push(`/projects/${props.project.id}/tasks/${taskId}`);
 }
 
 function isActiveProject() {
@@ -300,7 +260,7 @@ function isActiveProject() {
 }
 
 function isSameTreeRow(
-  marker: TreeDragMarker | TreeDropMarker | null | undefined,
+  marker: TreeDragSource | TreeDropTarget | null | undefined,
   kind: TreeDragKind,
   projectId: string | null,
   taskId: string | null,
@@ -339,6 +299,12 @@ function buildMenu(): ContextMenuItem[] {
       label: "进入项目",
       icon: LayoutGrid,
       onSelect: () => router.push(`/projects/${props.project.id}`),
+    },
+    {
+      id: "open-popup-new-chat",
+      label: "在弹出窗口中创建对话",
+      icon: MessageSquarePlus,
+      onSelect: () => openProjectChatInPopup(),
     },
     {
       id: "pin",
@@ -412,6 +378,7 @@ function onMoreClick(e: MouseEvent) {
       :aria-expanded="isExpanded"
       v-context-menu="() => buildMenu()"
       @click="emit('toggle', project.id)"
+      @auxclick="onProjectAuxClick"
     >
       <span
         class="sb-tree__project-icon"
@@ -452,36 +419,18 @@ function onMoreClick(e: MouseEvent) {
 
     <div class="sb-collapse" :class="{ 'is-open': isExpanded }" :aria-hidden="!isExpanded">
       <div class="sb-collapse__inner">
-        <RouterLink v-for="c in visibleProjectConversations" :key="c.id"
-          :to="`/projects/${project.id}/tasks/${c.id}`" class="sb-tree__row sb-tree__row--child"
-          :class="[
-            { 'is-active': isActiveTask(c.id) },
-            treeRowStateClass('task', project.id, c.id),
-          ]"
-          draggable="false"
-          data-tree-kind="task"
-          :data-task-id="c.id"
-          :data-project-id="project.id"
-          :data-pinned="c.pinned ? 'true' : 'false'"
-          @dragstart.prevent
-          @mouseleave="onRowLeave">
-          <span class="sb-tree__name">{{ c.title }}</span>
-          <div class="sb-tree__hover-tools" @click.stop>
-            <button type="button" class="sb-icon-btn" :class="{ 'is-pinned': c.pinned }"
-              :title="c.pinned ? '取消置顶' : '置顶'"
-              :aria-label="c.pinned ? '取消置顶' : '置顶'"
-              @click="onTaskPinClick($event, c.id)">
-              <Pin :size="13" aria-hidden="true" />
-            </button>
-            <button type="button" class="sb-icon-btn" :class="{ 'is-confirming': confirmingId === c.id }"
-              :title="confirmingId === c.id ? '确认归档，再点一次' : '归档'"
-              :aria-label="confirmingId === c.id ? '确认归档，再点一次' : '归档'"
-              @click="onArchiveClick($event, c.id)">
-              <template v-if="confirmingId === c.id">确认</template>
-              <Archive v-else :size="13" aria-hidden="true" />
-            </button>
-          </div>
-        </RouterLink>
+        <SidebarTaskRow
+          v-for="c in visibleProjectConversations"
+          :key="c.id"
+          :task="c"
+          :project-id="project.id"
+          row-kind="child"
+          :active="isActiveTask(c.id)"
+          :archive="archiveProjectTask"
+          :tree-row-state-class="treeRowStateClass"
+          @open="openTask"
+          @error="emit('error', $event)"
+        />
         <button
           v-if="showConversationOverflow"
           type="button"
@@ -492,7 +441,10 @@ function onMoreClick(e: MouseEvent) {
         >
           ...
         </button>
-        <p v-if="projectConversations.length === 0" class="sb-tree__empty">
+        <p v-if="!projectTasksLoaded" class="sb-tree__empty">
+          加载中…
+        </p>
+        <p v-else-if="projectConversations.length === 0" class="sb-tree__empty">
           还没有对话
         </p>
       </div>

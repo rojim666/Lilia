@@ -1,95 +1,67 @@
 <script setup lang="ts">
-/**
- * 插件 / 技能管理面板。两块 backend 的扩展机制不对称，用 tab 切：
- * - Claude Skills（user / project scope）
- * - Claude Plugins（marketplace beta，仅只读列出）
- * - Codex MCP servers（来自 ~/.codex/config.toml，只读 + 打开文件按钮）
- */
-import { computed, onMounted, ref } from "vue";
+import { ref } from "vue";
+import { AlertTriangle, RefreshCw } from "lucide-vue-next";
+import ConfirmDialog from "../components/ConfirmDialog.vue";
 import {
-  Puzzle, Sparkles, Server, Plus, RefreshCw, Trash2, FolderOpen,
-  AlertTriangle, Check, Layers, Folder,
-} from "lucide-vue-next";
-import {
-  pluginsOverview,
   createClaudeSkill,
+  deleteClaudeMcpServer,
+  deleteCodexMcpServer,
   deleteClaudeSkill,
-  setClaudeSkillEnabled,
+  openClaudeMcpConfig,
   openCodexConfig,
+  setClaudeMcpServerEnabled,
+  setCodexMcpServerEnabled,
+  setClaudePluginEnabled,
+  setClaudeSkillEnabled,
+  type ClaudeMcpServer,
   type ClaudePlugin,
   type ClaudeSkill,
   type CodexMcpServer,
-  type PluginScope,
 } from "../services/plugins";
-import { listProjects } from "../services/projectsStore";
-import Dropdown from "../components/Dropdown.vue";
-import ConfirmDialog from "../components/ConfirmDialog.vue";
+import { usePluginsOverview } from "./plugins/usePluginsOverview";
+import { useClaudeMcpEditor } from "./plugins/useClaudeMcpEditor";
+import { useCodexMcpEditor } from "./plugins/useCodexMcpEditor";
+import PluginsTabBar from "./plugins/PluginsTabBar.vue";
+import ClaudeSkillsTab from "./plugins/ClaudeSkillsTab.vue";
+import ClaudePluginsTab from "./plugins/ClaudePluginsTab.vue";
+import ClaudeMcpTab from "./plugins/ClaudeMcpTab.vue";
+import CodexMcpTab from "./plugins/CodexMcpTab.vue";
+import SkillCreateDialog from "./plugins/SkillCreateDialog.vue";
+import ClaudeMcpEditorDialog from "./plugins/ClaudeMcpEditorDialog.vue";
 
-type Tab = "claude-skills" | "claude-plugins" | "codex-mcp";
+const {
+  tab,
+  scope,
+  projectCwd,
+  projectOptions,
+  userSkills,
+  projectSkills,
+  claudePlugins,
+  claudeMcpServers,
+  claudeMcpConfigPath,
+  codexServers,
+  codexConfigPath,
+  warnings,
+  loading,
+  errorText,
+  currentSkills,
+  currentScopeHint,
+  refresh,
+  onProjectChange,
+} = usePluginsOverview();
 
-const tab = ref<Tab>("claude-skills");
-const scope = ref<PluginScope>("user");
-
-const projects = computed(() => listProjects());
-/** 「项目级 skill」只对真的有 cwd 的项目可用，分类型项目排除。 */
-const projectsWithCwd = computed(() =>
-  projects.value.filter((p): p is typeof p & { cwd: string } => !!p.cwd),
-);
-const projectCwd = ref<string | null>(projectsWithCwd.value[0]?.cwd ?? null);
-const projectOptions = computed(() =>
-  projectsWithCwd.value.map((p) => ({ value: p.cwd, label: p.name, hint: p.cwd })),
-);
-
-function onProjectChange(cwd: string) {
-  projectCwd.value = cwd;
-  refresh();
-}
-
-const userSkills = ref<ClaudeSkill[]>([]);
-const projectSkills = ref<ClaudeSkill[]>([]);
-const claudePlugins = ref<ClaudePlugin[]>([]);
-const codexServers = ref<CodexMcpServer[]>([]);
-const warnings = ref<string[]>([]);
-const loading = ref(false);
-const errorText = ref<string | null>(null);
-
-const currentSkills = computed(() =>
-  scope.value === "user" ? userSkills.value : projectSkills.value,
-);
-
-const currentScopeHint = computed(() =>
-  scope.value === "user"
-    ? "~/.claude/skills/"
-    : projectCwd.value
-      ? `${projectCwd.value}\\.claude\\skills\\`
-      : "未选择项目",
-);
-
-async function refresh() {
-  loading.value = true;
-  errorText.value = null;
-  try {
-    const data = await pluginsOverview(projectCwd.value);
-    userSkills.value = data.claudeUserSkills;
-    projectSkills.value = data.claudeProjectSkills;
-    claudePlugins.value = data.claudeUserPlugins;
-    codexServers.value = data.codexMcpServers;
-    warnings.value = data.warnings;
-  } catch (err) {
-    errorText.value = String(err);
-  } finally {
-    loading.value = false;
-  }
-}
-
-onMounted(() => refresh());
-
-// ---- Skill: 新建对话框 ----
 const showCreate = ref(false);
 const newName = ref("");
 const newDesc = ref("");
 const creating = ref(false);
 const createError = ref<string | null>(null);
+const pendingRemoveSkill = ref<ClaudeSkill | null>(null);
+const pendingRemoveMcp = ref<ClaudeMcpServer | null>(null);
+const pendingRemoveCodexMcp = ref<CodexMcpServer | null>(null);
+const removing = ref(false);
+
+const mcpEditor = useClaudeMcpEditor({ refresh });
+const codexMcpEditor = useCodexMcpEditor({ refresh });
 
 function openCreate() {
   newName.value = "";
@@ -122,11 +94,10 @@ async function confirmCreate() {
   }
 }
 
-// ---- Skill: 启停 / 删除 ----
 async function toggleSkill(skill: ClaudeSkill) {
   try {
     await setClaudeSkillEnabled(
-      skill.scope as PluginScope,
+      skill.scope,
       skill.scope === "project" ? projectCwd.value : null,
       skill.name,
       !skill.enabled,
@@ -137,24 +108,53 @@ async function toggleSkill(skill: ClaudeSkill) {
   }
 }
 
-async function removeSkill(skill: ClaudeSkill) {
-  pendingRemove.value = skill;
+async function togglePlugin(plugin: ClaudePlugin) {
+  try {
+    await setClaudePluginEnabled(plugin.scope, plugin.name, !plugin.enabled);
+    plugin.enabled = !plugin.enabled;
+  } catch (err) {
+    errorText.value = String(err);
+  }
 }
 
-const pendingRemove = ref<ClaudeSkill | null>(null);
-const removing = ref(false);
+async function toggleMcp(server: ClaudeMcpServer) {
+  try {
+    await setClaudeMcpServerEnabled(server.name, !server.enabled);
+    server.enabled = !server.enabled;
+  } catch (err) {
+    errorText.value = String(err);
+  }
+}
+
+async function toggleCodexMcp(server: CodexMcpServer) {
+  if (!server.editable) return;
+  try {
+    await setCodexMcpServerEnabled(server.name, !server.enabled);
+    server.enabled = !server.enabled;
+  } catch (err) {
+    errorText.value = String(err);
+  }
+}
 
 async function confirmRemove() {
-  const skill = pendingRemove.value;
-  if (!skill || removing.value) return;
+  if (removing.value) return;
   removing.value = true;
   try {
-    await deleteClaudeSkill(
-      skill.scope as PluginScope,
-      skill.scope === "project" ? projectCwd.value : null,
-      skill.name,
-    );
-    pendingRemove.value = null;
+    if (pendingRemoveSkill.value) {
+      const skill = pendingRemoveSkill.value;
+      await deleteClaudeSkill(
+        skill.scope,
+        skill.scope === "project" ? projectCwd.value : null,
+        skill.name,
+      );
+      pendingRemoveSkill.value = null;
+    } else if (pendingRemoveMcp.value) {
+      await deleteClaudeMcpServer(pendingRemoveMcp.value.name);
+      pendingRemoveMcp.value = null;
+    } else if (pendingRemoveCodexMcp.value) {
+      await deleteCodexMcpServer(pendingRemoveCodexMcp.value.name);
+      pendingRemoveCodexMcp.value = null;
+    }
     await refresh();
   } catch (err) {
     errorText.value = String(err);
@@ -163,7 +163,14 @@ async function confirmRemove() {
   }
 }
 
-// ---- Codex: 打开 config.toml ----
+async function openClaudeMcp() {
+  try {
+    await openClaudeMcpConfig();
+  } catch (err) {
+    errorText.value = String(err);
+  }
+}
+
 async function openCodex() {
   try {
     await openCodexConfig();
@@ -188,35 +195,13 @@ async function openCodex() {
       </div>
     </div>
 
-    <div class="plugins-tabs" role="tablist">
-      <button
-        type="button" role="tab"
-        :aria-selected="tab === 'claude-skills'"
-        :class="{ 'is-active': tab === 'claude-skills' }"
-        @click="tab = 'claude-skills'"
-      >
-        <Sparkles :size="14" aria-hidden="true" /> Claude Skills
-        <span class="plugins-tabs__count">{{ userSkills.length + projectSkills.length }}</span>
-      </button>
-      <button
-        type="button" role="tab"
-        :aria-selected="tab === 'claude-plugins'"
-        :class="{ 'is-active': tab === 'claude-plugins' }"
-        @click="tab = 'claude-plugins'"
-      >
-        <Puzzle :size="14" aria-hidden="true" /> Claude Plugins
-        <span class="plugins-tabs__count">{{ claudePlugins.length }}</span>
-      </button>
-      <button
-        type="button" role="tab"
-        :aria-selected="tab === 'codex-mcp'"
-        :class="{ 'is-active': tab === 'codex-mcp' }"
-        @click="tab = 'codex-mcp'"
-      >
-        <Server :size="14" aria-hidden="true" /> Codex MCP
-        <span class="plugins-tabs__count">{{ codexServers.length }}</span>
-      </button>
-    </div>
+    <PluginsTabBar
+      v-model="tab"
+      :skills-count="userSkills.length + projectSkills.length"
+      :plugins-count="claudePlugins.length"
+      :claude-mcp-count="claudeMcpServers.length"
+      :codex-mcp-count="codexServers.length"
+    />
 
     <div v-if="errorText" class="conn-banner conn-banner--err">
       <AlertTriangle :size="16" aria-hidden="true" />
@@ -236,182 +221,108 @@ async function openCodex() {
       </div>
     </div>
 
-    <!-- ===== Claude Skills ===== -->
-    <div v-if="tab === 'claude-skills'" class="card card--allow-overflow">
-      <div class="plugins-toolbar">
-        <div class="segmented" role="radiogroup" aria-label="Skill scope">
-          <button
-            type="button" role="radio"
-            :aria-checked="scope === 'user'"
-            :class="{ 'is-active': scope === 'user' }"
-            @click="scope = 'user'"
-          >
-            <Layers :size="12" aria-hidden="true" /> 全局
-          </button>
-          <button
-            type="button" role="radio"
-            :aria-checked="scope === 'project'"
-            :class="{ 'is-active': scope === 'project' }"
-            @click="scope = 'project'"
-          >
-            <Layers :size="12" aria-hidden="true" /> 项目
-          </button>
-        </div>
+    <ClaudeSkillsTab
+      v-if="tab === 'claude-skills'"
+      v-model:scope="scope"
+      :project-cwd="projectCwd"
+      :project-options="projectOptions"
+      :current-skills="currentSkills"
+      :current-scope-hint="currentScopeHint"
+      @project-change="onProjectChange"
+      @create="openCreate"
+      @toggle="toggleSkill"
+      @remove="pendingRemoveSkill = $event"
+    />
 
-        <Dropdown
-          v-if="scope === 'project' && projectCwd"
-          :model-value="projectCwd"
-          :options="projectOptions"
-          :icon="Folder"
-          placement="bottom"
-          @update:model-value="onProjectChange"
-        />
-        <span v-else-if="scope === 'project'" class="muted">尚未配置项目</span>
+    <ClaudePluginsTab
+      v-else-if="tab === 'claude-plugins'"
+      :plugins="claudePlugins"
+      @toggle="togglePlugin"
+    />
 
-        <span class="plugins-toolbar__hint">{{ currentScopeHint }}</span>
+    <ClaudeMcpTab
+      v-else-if="tab === 'claude-mcp'"
+      :servers="claudeMcpServers"
+      :config-path="claudeMcpConfigPath"
+      @open-config="openClaudeMcp"
+      @create="mcpEditor.openCreateMcp"
+      @edit="mcpEditor.openEditMcp"
+      @toggle="toggleMcp"
+      @remove="pendingRemoveMcp = $event"
+    />
 
-        <button type="button" class="primary" @click="openCreate">
-          <Plus :size="14" aria-hidden="true" /> 新建 Skill
-        </button>
-      </div>
+    <CodexMcpTab
+      v-else
+      :servers="codexServers"
+      :config-path="codexConfigPath"
+      @open-config="openCodex"
+      @create="codexMcpEditor.openCreateMcp"
+      @edit="codexMcpEditor.openEditMcp"
+      @toggle="toggleCodexMcp"
+      @remove="pendingRemoveCodexMcp = $event"
+    />
 
-      <ul v-if="currentSkills.length" class="plugins-list">
-        <li
-          v-for="s in currentSkills"
-          :key="s.path"
-          class="plugins-list__item"
-          :class="{ 'is-disabled': !s.enabled }"
-        >
-          <div class="plugins-list__head">
-            <span class="plugins-list__name">{{ s.name }}</span>
-            <span v-if="s.enabled" class="plugins-list__badge plugins-list__badge--ok">
-              <Check :size="11" aria-hidden="true" /> 已启用
-            </span>
-            <span v-else class="plugins-list__badge plugins-list__badge--mute">已停用</span>
-          </div>
-          <p class="plugins-list__desc">{{ s.description || "（无描述）" }}</p>
-          <div class="plugins-list__meta">
-            <code>{{ s.path }}</code>
-          </div>
-          <div class="plugins-list__actions">
-            <button type="button" class="ghost" @click="toggleSkill(s)">
-              {{ s.enabled ? "停用" : "启用" }}
-            </button>
-            <button type="button" class="ghost danger" @click="removeSkill(s)">
-              <Trash2 :size="12" aria-hidden="true" /> 删除
-            </button>
-          </div>
-        </li>
-      </ul>
-      <p v-else class="plugins-empty">
-        {{ scope === 'user' ? '全局' : '项目' }} skill 目录里还没有任何 SKILL.md。
-      </p>
-    </div>
+    <SkillCreateDialog
+      v-model:open="showCreate"
+      v-model:name="newName"
+      v-model:description="newDesc"
+      :scope-hint="currentScopeHint"
+      :creating="creating"
+      :error="createError"
+      @confirm="confirmCreate"
+    />
 
-    <!-- ===== Claude Plugins ===== -->
-    <div v-else-if="tab === 'claude-plugins'" class="card">
-      <p class="plugins-section-hint">
-        来自 <code>~/.claude/plugins/</code> 的 marketplace 插件（beta），一期仅展示。
-      </p>
-      <ul v-if="claudePlugins.length" class="plugins-list">
-        <li v-for="p in claudePlugins" :key="p.path" class="plugins-list__item">
-          <div class="plugins-list__head">
-            <span class="plugins-list__name">{{ p.name }}</span>
-            <span class="plugins-list__badge plugins-list__badge--mute">v{{ p.version || "—" }}</span>
-          </div>
-          <p class="plugins-list__desc">{{ p.description || "（无描述）" }}</p>
-          <div class="plugins-list__meta"><code>{{ p.path }}</code></div>
-        </li>
-      </ul>
-      <p v-else class="plugins-empty">没有发现已安装的 plugin。</p>
-    </div>
+    <ClaudeMcpEditorDialog
+      v-model:open="mcpEditor.showMcpEditor.value"
+      v-model:name="mcpEditor.mcpName.value"
+      v-model:command="mcpEditor.mcpCommand.value"
+      v-model:args-text="mcpEditor.mcpArgsText.value"
+      :env-rows="mcpEditor.mcpEnvRows.value"
+      :editing-mcp="mcpEditor.editingMcp.value"
+      :title="mcpEditor.mcpEditorTitle.value"
+      server-label="Claude MCP"
+      :saving="mcpEditor.mcpSaving.value"
+      :error="mcpEditor.mcpError.value"
+      :config-path="claudeMcpConfigPath || '~/.lilia/config/claude-mcp-servers.json'"
+      @add-env-row="mcpEditor.addMcpEnvRow"
+      @remove-env-row="mcpEditor.removeMcpEnvRow"
+      @confirm="mcpEditor.saveMcpServer"
+    />
 
-    <!-- ===== Codex MCP ===== -->
-    <div v-else class="card">
-      <div class="plugins-toolbar">
-        <span class="plugins-toolbar__hint">来自 <code>~/.codex/config.toml</code> 的 mcp_servers 节</span>
-        <button type="button" class="ghost" @click="openCodex">
-          <FolderOpen :size="12" aria-hidden="true" /> 打开 config.toml
-        </button>
-      </div>
-      <ul v-if="codexServers.length" class="plugins-list">
-        <li v-for="s in codexServers" :key="s.name" class="plugins-list__item">
-          <div class="plugins-list__head">
-            <span class="plugins-list__name">{{ s.name }}</span>
-            <span class="plugins-list__badge plugins-list__badge--ok">
-              <Check :size="11" aria-hidden="true" /> 已注册
-            </span>
-          </div>
-          <div class="plugins-list__meta">
-            <code>{{ s.command }} {{ s.args.join(' ') }}</code>
-          </div>
-        </li>
-      </ul>
-      <p v-else class="plugins-empty">
-        config.toml 里还没有 mcp_servers 节，点击「打开 config.toml」开始添加。
-      </p>
-    </div>
+    <ClaudeMcpEditorDialog
+      v-model:open="codexMcpEditor.showMcpEditor.value"
+      v-model:name="codexMcpEditor.mcpName.value"
+      v-model:command="codexMcpEditor.mcpCommand.value"
+      v-model:args-text="codexMcpEditor.mcpArgsText.value"
+      :env-rows="codexMcpEditor.mcpEnvRows.value"
+      :editing-mcp="codexMcpEditor.editingMcp.value"
+      :title="codexMcpEditor.mcpEditorTitle.value"
+      server-label="Codex MCP"
+      :saving="codexMcpEditor.mcpSaving.value"
+      :error="codexMcpEditor.mcpError.value"
+      :config-path="codexConfigPath || '~/.codex/config.toml'"
+      @add-env-row="codexMcpEditor.addMcpEnvRow"
+      @remove-env-row="codexMcpEditor.removeMcpEnvRow"
+      @confirm="codexMcpEditor.saveMcpServer"
+    />
 
-    <!-- ===== Create Skill 弹层 ===== -->
-    <Teleport to="body">
-      <Transition name="search-palette">
-        <div
-          v-if="showCreate"
-          class="search-palette"
-          role="dialog" aria-modal="true" aria-label="新建 Skill"
-          @click.self="showCreate = false"
-        >
-          <div class="search-palette__card dialog__card">
-            <div class="dialog__header">
-              <Sparkles :size="14" aria-hidden="true" />
-              <span>新建 Claude Skill</span>
-            </div>
-            <div class="dialog__body">
-              <label>
-                <span>名称</span>
-                <input
-                  v-model="newName" type="text"
-                  class="text-input"
-                  placeholder="kebab-case，仅 a-z 0-9 - _"
-                />
-              </label>
-              <label>
-                <span>描述</span>
-                <textarea
-                  v-model="newDesc"
-                  class="text-input"
-                  rows="3"
-                  placeholder="一行描述，告诉 Claude 什么时候应该用这个 skill"
-                />
-              </label>
-              <p v-if="createError" class="plugins-create__error">{{ createError }}</p>
-              <p class="plugins-create__hint">
-                创建后会生成 <code>{{ currentScopeHint }}{{ newName || '<name>' }}/SKILL.md</code>。
-              </p>
-            </div>
-            <div class="dialog__actions">
-              <button type="button" class="ghost" :disabled="creating" @click="showCreate = false">
-                取消
-              </button>
-              <button type="button" class="primary" :disabled="creating" @click="confirmCreate">
-                {{ creating ? "创建中…" : "创建" }}
-              </button>
-            </div>
-          </div>
-        </div>
-      </Transition>
-    </Teleport>
-
-    <!-- ===== 删除 Skill 二次确认 ===== -->
     <ConfirmDialog
-      :open="pendingRemove !== null"
-      :title="`删除 skill「${pendingRemove?.name ?? ''}」？`"
-      message="该 skill 目录会被整体删除，不可恢复。"
+      :open="pendingRemoveSkill !== null || pendingRemoveMcp !== null || pendingRemoveCodexMcp !== null"
+      :title="pendingRemoveSkill
+        ? `删除 skill「${pendingRemoveSkill?.name ?? ''}」？`
+        : pendingRemoveMcp
+          ? `删除 Claude MCP「${pendingRemoveMcp?.name ?? ''}」？`
+          : `删除 Codex MCP「${pendingRemoveCodexMcp?.name ?? ''}」？`"
+      :message="pendingRemoveSkill
+        ? '该 skill 目录会被整体删除，不可恢复。'
+        : pendingRemoveMcp
+          ? '该 MCP server 会从 Lilia 配置中删除，不可恢复。'
+          : '该 stdio MCP server 会从 Codex config.toml 中删除，不可恢复。'"
       confirm-text="删除"
       busy-text="删除中…"
       :busy="removing"
       danger
-      @cancel="pendingRemove = null"
+      @cancel="pendingRemoveSkill = null; pendingRemoveMcp = null; pendingRemoveCodexMcp = null"
       @confirm="confirmRemove"
     />
   </section>

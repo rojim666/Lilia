@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { FileText, Search, X } from "lucide-vue-next";
 import { searchSessions, type SearchResult } from "../../services/sessionSearch";
+import { ensureAllProjectTasksLoaded } from "../../services/tasksStore";
 
 interface Segment {
   text: string;
@@ -24,9 +25,10 @@ const active = computed({
 const query = ref("");
 const inputRef = ref<HTMLInputElement | null>(null);
 const selectedIdx = ref(0);
+const hydrating = ref(false);
 
 const results = computed<SearchResult[]>(() =>
-  searchSessions(query.value, "hybrid").slice(0, 12),
+  searchSessions(query.value).slice(0, 12),
 );
 
 watch(results, () => {
@@ -37,8 +39,19 @@ async function openSearch() {
   active.value = true;
   query.value = "";
   selectedIdx.value = 0;
+  void hydrateCorpus();
   await nextTick();
   inputRef.value?.focus();
+}
+
+async function hydrateCorpus() {
+  if (hydrating.value) return;
+  hydrating.value = true;
+  try {
+    await ensureAllProjectTasksLoaded();
+  } finally {
+    hydrating.value = false;
+  }
 }
 
 function closeSearch() {

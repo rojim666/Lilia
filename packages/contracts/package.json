@@ -8,11 +8,13 @@
   "exports": {
     ".": "./src/index.ts",
     "./claudeTools.mjs": "./src/claudeTools.mjs",
-    "./liliaTools.mjs": "./src/liliaTools.mjs"
+    "./liliaTools.mjs": "./src/liliaTools.mjs",
+    "./toolUtils.mjs": "./src/toolUtils.mjs"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check:package-manager": "node ../../scripts/check-package-manager.mjs",
+    "build": "node ../../scripts/check-package-manager.mjs && tsc -p tsconfig.json",
+    "check": "node ../../scripts/check-package-manager.mjs && tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "typescript": "~5.8.3"

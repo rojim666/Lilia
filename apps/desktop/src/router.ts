@@ -1,18 +1,23 @@
 import {
   createRouter,
+  createWebHashHistory,
   createWebHistory,
   type RouterHistory,
 } from "vue-router";
-import { defineComponent, h } from "vue";
+import { defineAsyncComponent, defineComponent, h } from "vue";
 import AppShell from "./layouts/AppShell.vue";
-import TaskDetail from "./pages/TaskDetail.vue";
-import Settings from "./pages/Settings.vue";
-import Plugins from "./pages/Plugins.vue";
-import ProjectsOverview from "./pages/project/ProjectsOverview.vue";
-import ProjectShell from "./pages/project/ProjectShell.vue";
-import SessionsView from "./pages/project/SessionsView.vue";
-import RoadmapView from "./pages/project/RoadmapView.vue";
-import MemoryView from "./pages/project/MemoryView.vue";
+
+const PopupShell = () => import("./layouts/PopupShell.vue");
+const TaskDetail = () => import("./pages/TaskDetail.vue");
+const MainTaskDetail = defineAsyncComponent(() => import("./pages/TaskDetail.vue"));
+const PopupDraftBoot = () => import("./pages/PopupDraftBoot.vue");
+const Settings = () => import("./pages/Settings.vue");
+const Plugins = () => import("./pages/Plugins.vue");
+const ProjectsOverview = () => import("./pages/project/ProjectsOverview.vue");
+const ProjectShell = () => import("./pages/project/ProjectShell.vue");
+const SessionsView = () => import("./pages/project/SessionsView.vue");
+const RoadmapView = () => import("./pages/project/RoadmapView.vue");
+const MemoryView = () => import("./pages/project/MemoryView.vue");
 
 const Home = defineComponent({
   name: "LiliaHome",
@@ -26,10 +31,56 @@ const Home = defineComponent({
   },
 });
 
-export function createLiliaRouter(history: RouterHistory = createWebHistory()) {
+export function shouldUsePopupHashHistory(hash: string): boolean {
+  return hash.startsWith("#/popup");
+}
+
+function createDefaultHistory(): RouterHistory {
+  if (
+    typeof window !== "undefined" &&
+    shouldUsePopupHashHistory(window.location.hash)
+  ) {
+    return createWebHashHistory();
+  }
+  return createWebHistory();
+}
+
+export function createLiliaRouter(history: RouterHistory = createDefaultHistory()) {
   return createRouter({
     history,
     routes: [
+      {
+        path: "/popup",
+        component: PopupShell,
+        children: [
+          {
+            path: "projects/:projectId/new",
+            component: PopupDraftBoot,
+            props: true,
+          },
+          {
+            path: "projects/:projectId/tasks/:taskId",
+            component: TaskDetail,
+            props: (route) => ({
+              projectId: route.params.projectId,
+              taskId: route.params.taskId,
+              variant: "popup",
+            }),
+          },
+          {
+            path: "chats/new",
+            component: PopupDraftBoot,
+          },
+          {
+            path: "chats/:taskId",
+            component: TaskDetail,
+            props: (route) => ({
+              taskId: route.params.taskId,
+              variant: "popup",
+            }),
+          },
+        ],
+      },
       {
         path: "/",
         component: AppShell,
@@ -42,20 +93,38 @@ export function createLiliaRouter(history: RouterHistory = createWebHistory()) {
             component: ProjectShell,
             props: true,
             children: [
-              { path: "", component: SessionsView, props: true },
-              { path: "roadmap", component: RoadmapView, props: true },
-              { path: "memory", component: MemoryView, props: true },
+              {
+                path: "",
+                name: "project-sessions",
+                component: SessionsView,
+                props: true,
+                meta: { projectTab: "sessions" },
+              },
+              {
+                path: "roadmap",
+                name: "project-roadmap",
+                component: RoadmapView,
+                props: true,
+                meta: { projectTab: "roadmap" },
+              },
+              {
+                path: "memory",
+                name: "project-memory",
+                component: MemoryView,
+                props: true,
+                meta: { projectTab: "memory" },
+              },
             ],
           },
           // 任务详情是 ProjectShell 的兄弟路由，进入聊天时 ViewTabs 不渲染。
           {
             path: "projects/:projectId/tasks/:taskId",
-            component: TaskDetail,
+            component: MainTaskDetail,
             props: true,
           },
           {
             path: "chats/:taskId",
-            component: TaskDetail,
+            component: MainTaskDetail,
             props: true,
           },
           { path: "settings", component: Settings },

@@ -8,6 +8,7 @@ import { askUserForTask } from "./useAskUser";
 import { emitDebugTimelineEvent } from "./useDebugTimelineEvents";
 import { requestLocalToolConsent } from "./useToolConsentBridge";
 import type { ToolConsentRequest } from "../services/chat";
+import { applyAgentTodoEvent, type AgentTodoInput } from "../services/todos";
 
 let debugSeq = 0;
 
@@ -121,6 +122,25 @@ function debugAskEvent(
   });
 }
 
+function emitStaticDebugEvent(
+  taskId: string,
+  presetId: string,
+  event: Pick<Parameters<typeof createDebugEvent>[0],
+    "kind" | "title" | "summary" | "payload"
+  >,
+) {
+  const ids = nextDebugIds(taskId, presetId);
+  emitDebugTimelineEvent(createDebugEvent({
+    id: ids.eventId,
+    taskId,
+    turnId: ids.turnId,
+    status: "success",
+    now: ids.now,
+    order: ids.order,
+    ...event,
+  }));
+}
+
 export function useDebugTimelineInteractions(taskId: string) {
   function emitTodo() {
     const ids = nextDebugIds(taskId, "todo");
@@ -142,6 +162,43 @@ export function useDebugTimelineInteractions(taskId: string) {
         ],
       },
     }));
+  }
+
+  async function emitTodoTool() {
+    const ids = nextDebugIds(taskId, "todo-tool");
+    const items: AgentTodoInput[] = [
+      { content: "完成 Claude TodoWrite 调试接线", status: "completed" },
+      { content: "确认 TodoFloat 自动刷新", status: "in_progress" },
+      { content: "验证手动 Todo 不被 agent 覆盖", status: "pending" },
+    ];
+    try {
+      await applyAgentTodoEvent(taskId, items);
+      emitDebugTimelineEvent(createDebugEvent({
+        id: ids.eventId,
+        taskId,
+        turnId: ids.turnId,
+        kind: "todo_list",
+        title: "Debug TodoWrite",
+        summary: "模拟 Claude TodoWrite 并刷新 Lilia Todo",
+        status: "success",
+        now: ids.now,
+        order: ids.order,
+        payload: { items: items as unknown as AgentTimelinePayload },
+      }));
+    } catch (err) {
+      emitDebugTimelineEvent(createDebugEvent({
+        id: ids.eventId,
+        taskId,
+        turnId: ids.turnId,
+        kind: "error",
+        title: "Debug TodoWrite 失败",
+        summary: String(err),
+        status: "error",
+        now: ids.now,
+        order: ids.order,
+        payload: { message: String(err) },
+      }));
+    }
   }
 
   function emitPlan() {
@@ -374,7 +431,6 @@ export function useDebugTimelineInteractions(taskId: string) {
       payload: {
         subkind: "write",
         interaction: "tool_consent",
-        permissionRequest: true,
         requestId: ids.requestId,
         toolName: request.toolName,
         path: "apps/desktop/src/debug-fixture.ts",
@@ -395,57 +451,36 @@ export function useDebugTimelineInteractions(taskId: string) {
   }
 
   function emitCommand() {
-    const ids = nextDebugIds(taskId, "command");
-    emitDebugTimelineEvent(createDebugEvent({
-      id: ids.eventId,
-      taskId,
-      turnId: ids.turnId,
+    emitStaticDebugEvent(taskId, "command", {
       kind: "command",
       title: "Debug Bash",
       summary: "yarn verify:contracts",
-      status: "success",
-      now: ids.now,
-      order: ids.order,
       payload: {
         command: "yarn verify:contracts",
         cwd: "D:/PROJECT/workspace/Lilia",
         output: "Contracts verified.",
         exitCode: 0,
       },
-    }));
+    });
   }
 
   function emitFileRead() {
-    const ids = nextDebugIds(taskId, "file-read");
-    emitDebugTimelineEvent(createDebugEvent({
-      id: ids.eventId,
-      taskId,
-      turnId: ids.turnId,
+    emitStaticDebugEvent(taskId, "file-read", {
       kind: "file_read",
       title: "Debug Read",
       summary: "packages/contracts/src/index.ts",
-      status: "success",
-      now: ids.now,
-      order: ids.order,
       payload: {
         path: "packages/contracts/src/index.ts",
         output: "export interface AgentInteractionSettings { debug: boolean }",
       },
-    }));
+    });
   }
 
   function emitFileChange() {
-    const ids = nextDebugIds(taskId, "file-change");
-    emitDebugTimelineEvent(createDebugEvent({
-      id: ids.eventId,
-      taskId,
-      turnId: ids.turnId,
+    emitStaticDebugEvent(taskId, "file-change", {
       kind: "file_change",
       title: "Debug Edit",
       summary: "apps/desktop/src/pages/TaskDetail.vue",
-      status: "success",
-      now: ids.now,
-      order: ids.order,
       payload: {
         subkind: "edit",
         path: "apps/desktop/src/pages/TaskDetail.vue",
@@ -454,12 +489,13 @@ export function useDebugTimelineInteractions(taskId: string) {
           { kind: "edit", path: "apps/desktop/src/components/chat/DebugTimelinePanel.vue" },
         ],
       },
-    }));
+    });
   }
 
   return {
     emitPlan,
     emitTodo,
+    emitTodoTool,
     emitAskUser,
     emitAskUserMulti,
     emitAskUserPreview,

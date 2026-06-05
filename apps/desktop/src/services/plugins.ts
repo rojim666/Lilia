@@ -5,14 +5,26 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ClaudeMcpServer,
+  ClaudeMcpServerInput,
   ClaudePlugin,
   ClaudeSkill,
   CodexMcpServer,
+  CodexMcpServerInput,
   PluginScope,
   PluginsOverview,
 } from "@lilia/contracts";
 
-export type { ClaudePlugin, ClaudeSkill, CodexMcpServer, PluginScope, PluginsOverview };
+export type {
+  ClaudeMcpServer,
+  ClaudeMcpServerInput,
+  ClaudePlugin,
+  ClaudeSkill,
+  CodexMcpServer,
+  CodexMcpServerInput,
+  PluginScope,
+  PluginsOverview,
+};
 
 export function pluginsOverview(projectCwd?: string | null): Promise<PluginsOverview> {
   return invoke<PluginsOverview>("plugins_overview", {
@@ -70,12 +82,66 @@ export function setClaudeSkillEnabled(
   });
 }
 
+export function setClaudePluginEnabled(
+  scope: PluginScope,
+  name: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke<void>("plugins_set_claude_plugin_enabled", {
+    scope,
+    name,
+    enabled,
+  });
+}
+
 export function listClaudePlugins(scope: PluginScope): Promise<ClaudePlugin[]> {
   return invoke<ClaudePlugin[]>("plugins_list_claude_plugins", { scope });
 }
 
+export function createClaudeMcpServer(input: ClaudeMcpServerInput): Promise<ClaudeMcpServer> {
+  return invoke<ClaudeMcpServer>("plugins_create_claude_mcp_server", { input });
+}
+
+export function updateClaudeMcpServer(
+  name: string,
+  input: ClaudeMcpServerInput,
+): Promise<ClaudeMcpServer> {
+  return invoke<ClaudeMcpServer>("plugins_update_claude_mcp_server", { name, input });
+}
+
+export function deleteClaudeMcpServer(name: string): Promise<void> {
+  return invoke<void>("plugins_delete_claude_mcp_server", { name });
+}
+
+export function setClaudeMcpServerEnabled(name: string, enabled: boolean): Promise<void> {
+  return invoke<void>("plugins_set_claude_mcp_server_enabled", { name, enabled });
+}
+
+export function openClaudeMcpConfig(): Promise<void> {
+  return invoke<void>("plugins_open_claude_mcp_config");
+}
+
 export function listCodexMcpServers(): Promise<CodexMcpServer[]> {
   return invoke<CodexMcpServer[]>("plugins_list_codex_mcp_servers");
+}
+
+export function createCodexMcpServer(input: CodexMcpServerInput): Promise<CodexMcpServer> {
+  return invoke<CodexMcpServer>("plugins_create_codex_mcp_server", { input });
+}
+
+export function updateCodexMcpServer(
+  name: string,
+  input: CodexMcpServerInput,
+): Promise<CodexMcpServer> {
+  return invoke<CodexMcpServer>("plugins_update_codex_mcp_server", { name, input });
+}
+
+export function deleteCodexMcpServer(name: string): Promise<void> {
+  return invoke<void>("plugins_delete_codex_mcp_server", { name });
+}
+
+export function setCodexMcpServerEnabled(name: string, enabled: boolean): Promise<void> {
+  return invoke<void>("plugins_set_codex_mcp_server_enabled", { name, enabled });
 }
 
 export function openCodexConfig(): Promise<void> {

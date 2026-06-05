@@ -6,22 +6,46 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { TaskTodo } from "@lilia/contracts";
+import type {
+  ChatAttachment,
+  TaskTodo,
+  TaskTodoGuideStatus,
+  TaskTodoPriority,
+} from "@lilia/contracts";
 
 export type { TaskTodo };
+export type { TaskTodoGuideStatus, TaskTodoPriority };
+
+export interface AgentTodoInput {
+  content?: string;
+  text?: string;
+  title?: string;
+  description?: string;
+  status?: string;
+  completed?: boolean;
+  done?: boolean;
+  priority?: string;
+}
 
 export function listTodos(taskId: string): Promise<TaskTodo[]> {
   return invoke<TaskTodo[]>("todo_list", { taskId });
 }
 
-export function createTodo(taskId: string, text: string): Promise<TaskTodo> {
-  return invoke<TaskTodo>("todo_create", { taskId, text });
+export function createTodo(
+  taskId: string,
+  text: string,
+  priority: TaskTodoPriority = "normal",
+  attachments: ChatAttachment[] = [],
+): Promise<TaskTodo> {
+  return invoke<TaskTodo>("todo_create", { taskId, text, priority, attachments });
 }
 
 export interface TodoPatch {
   text?: string;
   done?: boolean;
   order?: number;
+  priority?: TaskTodoPriority;
+  guideStatus?: TaskTodoGuideStatus;
 }
 
 /**
@@ -33,11 +57,20 @@ export function updateTodo(id: string, patch: TodoPatch): Promise<void> {
     text: patch.text ?? null,
     done: patch.done ?? null,
     order: patch.order ?? null,
+    priority: patch.priority ?? null,
+    guideStatus: patch.guideStatus ?? null,
   });
 }
 
 export function deleteTodo(id: string): Promise<void> {
   return invoke<void>("todo_delete", { id });
+}
+
+export function applyAgentTodoEvent(
+  taskId: string,
+  todos: AgentTodoInput[],
+): Promise<TaskTodo[]> {
+  return invoke<TaskTodo[]>("todo_apply_agent_event", { taskId, todos });
 }
 
 export interface TodoChangedEvent {

@@ -1,5 +1,11 @@
 import { vi } from "vitest";
 
+const CODEX_MODEL_OPTIONS = [
+  { id: "gpt-5.5", label: "GPT-5.5" },
+  { id: "gpt-5.4", label: "GPT-5.4" },
+  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini" },
+] as const;
+
 interface ProjectRow {
   id: string;
   name: string;
@@ -20,6 +26,7 @@ interface TaskRow {
   dependsOn: string[];
   sortOrder: number;
   pinned: boolean;
+  archived?: boolean;
 }
 
 /**
@@ -40,6 +47,31 @@ interface AgentTimelineEvent {
   updatedAt: number;
   turnSeq: number;
   intraTurnOrder: number;
+}
+
+interface TodoRow {
+  id: string;
+  taskId: string;
+  text: string;
+  done: boolean;
+  order: number;
+  source: "lilia" | "agent";
+  priority: "high" | "normal" | "low";
+  guideStatus: "pending" | "queued" | "sent" | null;
+  attachments: unknown[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface AgentTodoInput {
+  content?: unknown;
+  text?: unknown;
+  title?: unknown;
+  description?: unknown;
+  status?: unknown;
+  completed?: unknown;
+  done?: unknown;
+  priority?: unknown;
 }
 
 const baseProjects: ProjectRow[] = [
@@ -115,12 +147,96 @@ const baseTasks: TaskRow[] = [
 let projects: ProjectRow[] = [];
 let tasks: TaskRow[] = [];
 let timelineEvents: Record<string, AgentTimelineEvent[]> = {};
+let todosByTaskId: Record<string, TodoRow[]> = {};
+let todoSeq = 0;
 let chatRunning: Record<string, boolean> = {};
 let chatQueued: Record<string, Array<Record<string, unknown>>> = {};
-let agentInteractionSettings = { nonInterruptMode: false, debug: false };
+let nextChatSendError: string | null = null;
+let clipboardFilePaths: string[] = [];
+let clipboardImageSeq = 0;
+let clipboardTextSeq = 0;
+let activeBackend: "claude" | "codex" = "claude";
+let codexAppServerStatus = {
+  version: "codex-cli 0.128.0",
+  available: true,
+  supportsRequiredProtocol: true,
+  issues: [] as string[],
+};
+let composerStateHandler: ((taskId: string) => unknown | Promise<unknown>) | null = null;
+const baseClaudePlugins = [{
+  scope: "user",
+  name: "demo-plugin",
+  description: "测试用 Claude plugin",
+  version: "1.0.0",
+  enabled: true,
+  path: "C:\\Users\\mock\\.claude\\plugins\\demo-plugin",
+}];
+const baseClaudeMcpServers = [{
+  name: "weather",
+  command: "node",
+  args: ["weather-mcp.js"],
+  envKeys: ["WEATHER_TOKEN"],
+  enabled: true,
+}];
+const baseCodexMcpServers = [
+  {
+    name: "mock-mcp",
+    command: "node",
+    args: ["mock-mcp.js"],
+    envKeys: ["MOCK_TOKEN"],
+    enabled: true,
+    transport: "stdio",
+    editable: true,
+  },
+  {
+    name: "remote-mcp",
+    command: "",
+    args: [],
+    envKeys: [],
+    enabled: true,
+    transport: "http",
+    editable: false,
+  },
+];
+let claudePlugins = baseClaudePlugins.map((plugin) => ({ ...plugin }));
+let claudeMcpServers = baseClaudeMcpServers.map((server) => ({
+  ...server,
+  args: [...server.args],
+  envKeys: [...server.envKeys],
+}));
+let codexMcpServers = baseCodexMcpServers.map((server) => ({
+  ...server,
+  args: [...server.args],
+  envKeys: [...server.envKeys],
+}));
+function defaultAgentInteractionSettings() {
+  return {
+    nonInterruptMode: false,
+    debug: false,
+    codexProfile: {
+      profile: "default",
+      model: null,
+      reasoningEffort: null,
+      runtimeWorkspaceRoots: [] as string[],
+      permissions: { profile: "default" },
+    },
+  };
+}
+
+let agentInteractionSettings = defaultAgentInteractionSettings();
+let conversationSuggestionSettings = {
+  enabled: true,
+  source: "assistant-ai" as "assistant-ai" | "provider",
+};
+let projectSettings = { cloneParentDir: null as string | null, codexDefaults: null as unknown };
+let popupWindowSettings: { shortcut: string | null } = { shortcut: null };
+let nextPopupSettingsError: string | null = null;
+let popupLastProjectId: string | null = null;
 let eventHandlers: Record<string, Array<(event: { payload: unknown }) => void>> = {};
 let webviewDragDropHandlers: Array<(event: { payload: unknown }) => void> = [];
 let projectPinUpdater: ((projectId: string, pinned: boolean) => void) | null = null;
+let windowScaleFactor = 1;
+let agentTimelineDelayMs = 0;
 
 function cloneProject(row: ProjectRow): ProjectRow {
   return { ...row };
@@ -130,18 +246,148 @@ function cloneTask(row: TaskRow): TaskRow {
   return { ...row, dependsOn: [...row.dependsOn] };
 }
 
+function cloneTodo(row: TodoRow): TodoRow {
+  return { ...row, attachments: [...row.attachments] };
+}
+
+function nextTodoId(): string {
+  todoSeq += 1;
+  return `todo-${todoSeq}`;
+}
+
+function readAgentTodoText(todo: unknown): string {
+  if (typeof todo === "string") return todo.trim();
+  if (!todo || typeof todo !== "object" || Array.isArray(todo)) return "";
+  const row = todo as AgentTodoInput;
+  const value = row.content ?? row.text ?? row.title ?? row.description;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function readAgentTodoDone(todo: unknown): boolean {
+  if (!todo || typeof todo !== "object" || Array.isArray(todo)) return false;
+  const row = todo as AgentTodoInput;
+  return row.completed === true ||
+    row.done === true ||
+    String(row.status ?? "").toLowerCase() === "completed";
+}
+
+function normalizeTodoPriority(value: unknown): "high" | "normal" | "low" {
+  const text = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (text === "high" || text === "low") return text;
+  return "normal";
+}
+
+function listMockTodos(taskId: string): TodoRow[] {
+  return [...(todosByTaskId[taskId] ?? [])]
+    .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt)
+    .map(cloneTodo);
+}
+
+function setMockGuideStatus(
+  guideId: unknown,
+  guideStatus: "pending" | "queued" | "sent",
+) {
+  if (typeof guideId !== "string" || !guideId) return;
+  const now = Date.now();
+  for (const taskId of Object.keys(todosByTaskId)) {
+    let changed = false;
+    todosByTaskId[taskId] = todosByTaskId[taskId].map((todo) => {
+      if (todo.id !== guideId || todo.source !== "lilia" || todo.guideStatus === guideStatus) {
+        return todo;
+      }
+      changed = true;
+      return { ...todo, guideStatus, updatedAt: now };
+    });
+    if (changed) {
+      emitTauriEvent("todo-changed", { taskId });
+      return;
+    }
+  }
+}
+
+function resetMockQueuedGuides(turns: Array<Record<string, unknown>> = []) {
+  for (const turn of turns) {
+    setMockGuideStatus(turn.guideId, "pending");
+  }
+}
+
+function applyMockAgentTodos(taskId: string, todos: unknown[]): TodoRow[] {
+  const now = Date.now();
+  const existing = todosByTaskId[taskId] ?? [];
+  const userRows = existing.filter((todo) => todo.source === "lilia");
+  const agentRows = existing.filter((todo) => todo.source === "agent");
+  const userMax = userRows.reduce((max, todo) => Math.max(max, todo.order), -1);
+  const nextAgentRows: TodoRow[] = [];
+
+  todos.forEach((todo, index) => {
+    const text = readAgentTodoText(todo);
+    if (!text) return;
+    const matched = agentRows.find((row) => row.text === text);
+    const nextRow: TodoRow = {
+      id: matched?.id ?? nextTodoId(),
+      taskId,
+      text,
+      done: readAgentTodoDone(todo),
+      order: userMax + 1 + index,
+      source: "agent",
+      priority: normalizeTodoPriority((todo as AgentTodoInput)?.priority),
+      guideStatus: null,
+      attachments: [],
+      createdAt: matched?.createdAt ?? now,
+      updatedAt: now,
+    };
+    nextAgentRows.push(nextRow);
+  });
+
+  todosByTaskId[taskId] = [...userRows, ...nextAgentRows];
+  return listMockTodos(taskId);
+}
+
 function refreshSessionCounts() {
   projects = projects.map((project) => ({
     ...project,
     sessionCount: tasks.filter((task) =>
-      task.projectId === project.id && task.status !== "cancelled"
+      !task.archived && task.projectId === project.id && task.status !== "cancelled"
     ).length,
   }));
+}
+
+function defaultModelForBackend(backend: "claude" | "codex") {
+  return backend === "codex" ? CODEX_MODEL_OPTIONS[0].id : "claude-sonnet-4-6";
+}
+
+function normalizeBackend(value: unknown): "claude" | "codex" {
+  return value === "codex" ? "codex" : "claude";
+}
+
+function modelBelongsToBackend(model: string, backend: "claude" | "codex") {
+  if (backend === "codex") {
+    return CODEX_MODEL_OPTIONS.some((option) => option.id === model);
+  }
+  return model.startsWith("claude-");
+}
+
+function normalizeComposer(input: unknown, taskId: string) {
+  const row = input && typeof input === "object" && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : {};
+  const backend = activeBackend;
+  const model = typeof row.model === "string" && modelBelongsToBackend(row.model, backend)
+    ? row.model
+    : defaultModelForBackend(backend);
+  return {
+    ...row,
+    taskId,
+    backend,
+    model,
+  };
 }
 
 export function resetTauriMockData() {
   projects = baseProjects.map(cloneProject);
   tasks = baseTasks.map(cloneTask);
+  todosByTaskId = {};
+  todoSeq = 0;
   timelineEvents = {
     "t-002": [
       {
@@ -163,13 +409,51 @@ export function resetTauriMockData() {
   };
   chatRunning = {};
   chatQueued = {};
-  agentInteractionSettings = { nonInterruptMode: false, debug: false };
+  nextChatSendError = null;
+  clipboardFilePaths = [];
+  clipboardImageSeq = 0;
+  clipboardTextSeq = 0;
+  activeBackend = "claude";
+  codexAppServerStatus = {
+    version: "codex-cli 0.128.0",
+    available: true,
+    supportsRequiredProtocol: true,
+    issues: [],
+  };
+  composerStateHandler = null;
+  claudePlugins = baseClaudePlugins.map((plugin) => ({ ...plugin }));
+  claudeMcpServers = baseClaudeMcpServers.map((server) => ({
+    ...server,
+    args: [...server.args],
+    envKeys: [...server.envKeys],
+  }));
+  codexMcpServers = baseCodexMcpServers.map((server) => ({
+    ...server,
+    args: [...server.args],
+    envKeys: [...server.envKeys],
+  }));
+  agentInteractionSettings = defaultAgentInteractionSettings();
+  conversationSuggestionSettings = { enabled: true, source: "assistant-ai" };
+  projectSettings = { cloneParentDir: null, codexDefaults: null };
+  popupWindowSettings = { shortcut: null };
+  nextPopupSettingsError = null;
+  popupLastProjectId = null;
   eventHandlers = {};
   webviewDragDropHandlers = [];
+  windowScaleFactor = 1;
+  agentTimelineDelayMs = 0;
+  mockCurrentWindow.label = "main";
+  mockCurrentWindow.isMaximized.mockClear();
+  mockCurrentWindow.onResized.mockClear();
+  mockCurrentWindow.minimize.mockClear();
+  mockCurrentWindow.toggleMaximize.mockClear();
+  mockCurrentWindow.close.mockClear();
+  mockCurrentWindow.scaleFactor.mockClear();
   refreshSessionCounts();
   mockInvoke.mockClear();
   mockListen.mockClear();
   mockGetCurrentWebview.mockClear();
+  mockGetCurrentWindow.mockClear();
 }
 
 export function emitTauriEvent(event: string, payload: unknown) {
@@ -178,10 +462,28 @@ export function emitTauriEvent(event: string, payload: unknown) {
   }
 }
 
+export function mockListenerCount(event: string): number {
+  return eventHandlers[event]?.length ?? 0;
+}
+
+export function setMockChatRunning(taskId: string, running: boolean) {
+  chatRunning[taskId] = running;
+}
+
+export function failNextMockChatSend(message: string) {
+  nextChatSendError = message;
+}
+
 export function emitWebviewDragDropEvent(payload: unknown) {
   for (const handler of webviewDragDropHandlers) {
     handler({ payload });
   }
+}
+
+export function setMockComposerStateHandler(
+  handler: ((taskId: string) => unknown | Promise<unknown>) | null,
+) {
+  composerStateHandler = handler;
 }
 
 export function setMockProjectPinned(projectId: string, pinned: boolean) {
@@ -189,6 +491,17 @@ export function setMockProjectPinned(projectId: string, pinned: boolean) {
     project.id === projectId ? { ...project, pinned } : project
   );
   projectPinUpdater?.(projectId, pinned);
+}
+
+export function setMockTaskArchived(taskId: string, archived: boolean) {
+  tasks = tasks.map((task) =>
+    task.id === taskId ? { ...task, archived } : task
+  );
+  refreshSessionCounts();
+}
+
+export function setMockAgentTimelineDelay(delayMs: number) {
+  agentTimelineDelayMs = delayMs;
 }
 
 export function bindMockProjectPinUpdater(
@@ -212,7 +525,7 @@ export function mockTasksByProjectForStore() {
   const byProject: Record<string, unknown[]> = {};
   for (const project of projects) {
     byProject[project.id] = tasks
-      .filter((task) => task.projectId === project.id)
+      .filter((task) => !task.archived && task.projectId === project.id)
       .map(cloneTask)
       .sort((a, b) =>
         Number(b.pinned) - Number(a.pinned) || a.sortOrder - b.sortOrder
@@ -234,7 +547,7 @@ export function mockTasksByProjectForStore() {
 
 export function mockOrphansForStore() {
   return tasks
-    .filter((task) => task.projectId === null)
+    .filter((task) => !task.archived && task.projectId === null)
     .map(cloneTask)
     .sort((a, b) =>
       Number(b.pinned) - Number(a.pinned) || a.sortOrder - b.sortOrder
@@ -257,6 +570,26 @@ export const mockGetCurrentWebview = vi.fn(() => ({
   }),
 }));
 
+export const mockCurrentWindow = {
+  label: "main",
+  isMaximized: vi.fn(async () => false),
+  onResized: vi.fn(async () => vi.fn()),
+  minimize: vi.fn(async () => undefined),
+  toggleMaximize: vi.fn(async () => undefined),
+  close: vi.fn(async () => undefined),
+  scaleFactor: vi.fn(async () => windowScaleFactor),
+};
+
+export const mockGetCurrentWindow = vi.fn(() => mockCurrentWindow);
+
+export function setMockCurrentWindowLabel(label: string) {
+  mockCurrentWindow.label = label;
+}
+
+export function setMockWindowScaleFactor(scaleFactor: number) {
+  windowScaleFactor = scaleFactor;
+}
+
 export function completeMockAgentTurn(taskId: string) {
   emitTauriEvent("chat:done", {
     taskId,
@@ -267,6 +600,7 @@ export function completeMockAgentTurn(taskId: string) {
   if (next) {
     chatQueued[taskId] = rest;
     chatRunning[taskId] = true;
+    setMockGuideStatus(next.guideId, "sent");
     const queuedMessage = (timelineEvents[taskId] ?? []).find((event) => {
       const payload = event.payload as Record<string, unknown> | null;
       return event.kind === "message" && payload?.queued === true;
@@ -329,6 +663,27 @@ export function emitMockTimelineEvent(
   ];
   emitTauriEvent("agent:timeline", event);
   return event;
+}
+
+export function replaceMockTimelineEvents(
+  taskId: string,
+  events: Partial<AgentTimelineEvent>[],
+) {
+  timelineEvents[taskId] = events.map((patch, index) => ({
+    id: patch.id ?? `tl-${taskId}-${index}`,
+    taskId,
+    turnId: patch.turnId ?? "turn-live",
+    backend: patch.backend ?? "claude",
+    kind: patch.kind ?? "command",
+    status: patch.status ?? "success",
+    title: patch.title ?? "历史事件",
+    summary: patch.summary ?? "",
+    payload: patch.payload ?? {},
+    createdAt: patch.createdAt ?? 10_000 + index,
+    updatedAt: patch.updatedAt ?? patch.createdAt ?? 10_000 + index,
+    turnSeq: patch.turnSeq ?? index,
+    intraTurnOrder: patch.intraTurnOrder ?? 0,
+  }));
 }
 
 /**
@@ -394,6 +749,26 @@ export function seedMockChatMessages(taskId: string, messages: unknown[]) {
   ];
 }
 
+export function setMockClipboardFilePaths(paths: string[]) {
+  clipboardFilePaths = [...paths];
+}
+
+export function setMockActiveBackend(backend: "claude" | "codex") {
+  activeBackend = backend;
+}
+
+export function setMockCodexAppServerStatus(status: Partial<typeof codexAppServerStatus>) {
+  codexAppServerStatus = {
+    ...codexAppServerStatus,
+    ...status,
+    issues: status.issues ? [...status.issues] : codexAppServerStatus.issues,
+  };
+}
+
+export function failNextPopupSettingsSave(message: string) {
+  nextPopupSettingsError = message;
+}
+
 export const mockListen = vi.fn(async (
   event: string,
   handler: (event: { payload: unknown }) => void,
@@ -416,6 +791,24 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
       const id = String(args.id);
       refreshSessionCounts();
       return projects.find((project) => project.id === id) ?? null;
+    }
+
+    case "project_get_settings":
+      return { ...projectSettings };
+
+    case "project_set_settings": {
+      const settings = args.settings && typeof args.settings === "object" && !Array.isArray(args.settings)
+        ? args.settings as Record<string, unknown>
+        : {};
+      projectSettings = {
+        cloneParentDir: typeof settings.cloneParentDir === "string"
+          ? settings.cloneParentDir
+          : null,
+        codexDefaults: "codexDefaults" in settings
+          ? settings.codexDefaults
+          : null,
+      };
+      return undefined;
     }
 
     case "project_create": {
@@ -453,14 +846,63 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
       return undefined;
     }
 
+    case "popup_get_window_settings":
+      return { ...popupWindowSettings };
+
+    case "popup_set_window_settings": {
+      if (nextPopupSettingsError) {
+        const message = nextPopupSettingsError;
+        nextPopupSettingsError = null;
+        throw new Error(message);
+      }
+      const input = args.settings && typeof args.settings === "object" && !Array.isArray(args.settings)
+        ? args.settings as Record<string, unknown>
+        : {};
+      const shortcut = typeof input.shortcut === "string" && input.shortcut.trim()
+        ? input.shortcut.trim()
+        : null;
+      popupWindowSettings = { shortcut };
+      return undefined;
+    }
+
+    case "popup_remember_last_project": {
+      const projectId = String(args.projectId ?? "");
+      if (projects.some((project) => project.id === projectId)) {
+        popupLastProjectId = projectId;
+      }
+      return undefined;
+    }
+
+    case "popup_open_new_chat": {
+      const projectId = typeof args.projectId === "string" ? args.projectId : null;
+      if (projectId) popupLastProjectId = projectId;
+      return undefined;
+    }
+
+    case "popup_open_task": {
+      const projectId = typeof args.projectId === "string" ? args.projectId : null;
+      if (projectId) popupLastProjectId = projectId;
+      return undefined;
+    }
+
+    case "popup_focus_main":
+      emitTauriEvent("lilia:main:navigate", { route: String(args.route ?? "/") });
+      return undefined;
+
     case "task_list": {
       const projectId = args.projectId as string | null | undefined;
       return tasks
-        .filter((task) => task.projectId === (projectId ?? null))
+        .filter((task) => !task.archived && task.projectId === (projectId ?? null))
         .map(cloneTask)
         .sort((a, b) =>
           Number(b.pinned) - Number(a.pinned) || a.sortOrder - b.sortOrder
         );
+    }
+
+    case "task_get": {
+      const id = String(args.id);
+      const row = tasks.find((task) => !task.archived && task.id === id);
+      return row ? cloneTask(row) : null;
     }
 
     case "task_toggle_pin": {
@@ -472,6 +914,30 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
         return { ...task, pinned };
       });
       return pinned;
+    }
+
+    case "task_create": {
+      const projectId = typeof args.projectId === "string" ? args.projectId : null;
+      const title = String(args.title ?? "新对话");
+      const status = String(args.status ?? "draft");
+      const dependsOn = Array.isArray(args.dependsOn) ? args.dependsOn.map(String) : [];
+      const id = `mock-task-${tasks.length + 1}`;
+      const row: TaskRow = {
+        id,
+        projectId,
+        sessionId: id,
+        title,
+        status,
+        createdAt: Date.now(),
+        parentId: typeof args.parentId === "string" ? args.parentId : null,
+        dependsOn,
+        sortOrder: tasks.filter((task) => task.projectId === projectId).length,
+        pinned: false,
+      };
+      tasks = [row, ...tasks];
+      refreshSessionCounts();
+      emitTauriEvent("tasks:changed", { projectId });
+      return cloneTask(row);
     }
 
     case "task_promote": {
@@ -494,6 +960,7 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
       };
       tasks = [row, ...tasks.filter((task) => task.id !== id)];
       refreshSessionCounts();
+      emitTauriEvent("tasks:changed", { projectId });
       return cloneTask(row);
     }
 
@@ -542,6 +1009,10 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
       return {
         nodeAvailable: true,
         codexCliAvailable: true,
+        codexAppServer: {
+          ...codexAppServerStatus,
+          issues: [...codexAppServerStatus.issues],
+        },
         ccSwitch: {
           reachable: true,
           baseUrl: "http://127.0.0.1:15721",
@@ -566,7 +1037,94 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
         },
       };
 
+    case "provider_get_active_backend":
+      return activeBackend;
+
+    case "provider_set_active_backend":
+      activeBackend = normalizeBackend(args.backend);
+      return undefined;
+
+    case "provider_get_config": {
+      const backend = normalizeBackend(args.backend);
+      return { backend, baseUrl: null, apiKey: null };
+    }
+
+    case "provider_set_config":
+      return undefined;
+
+    case "assistant_ai_get_config":
+      return { baseUrl: null, apiKey: null, model: null };
+
+    case "assistant_ai_set_config":
+      return undefined;
+
+    case "assistant_ai_test_connection":
+      return { ok: false, error: "baseUrl / apiKey / model 必须全部填写", models: null, modelMatched: null };
+
+    case "conversation_suggestions_get_settings":
+      return { ...conversationSuggestionSettings };
+
+    case "conversation_suggestions_set_settings": {
+      const settings = args.settings && typeof args.settings === "object" && !Array.isArray(args.settings)
+        ? args.settings as Record<string, unknown>
+        : {};
+      conversationSuggestionSettings = {
+        enabled: settings.enabled !== false,
+        source: settings.source === "provider" ? "provider" : "assistant-ai",
+      };
+      return undefined;
+    }
+
+    case "conversation_suggestions_get":
+      if (!conversationSuggestionSettings.enabled) return [];
+      return [
+        {
+          id: "sg-1",
+          projectId: typeof args.projectId === "string" ? args.projectId : null,
+          taskIds: ["t-002"],
+          summary: "补齐建议缓存测试",
+          reason: "最近对话已经接入了设置与空草稿入口，但缓存失效路径还需要验证。",
+          prompt: "请检查新对话建议的缓存命中、强制刷新和最近 timeline 更新失效逻辑，并补齐最小测试。",
+          generatedAt: Date.now(),
+        },
+        {
+          id: "sg-2",
+          projectId: typeof args.projectId === "string" ? args.projectId : null,
+          taskIds: ["t-002"],
+          summary: "优化空状态体验",
+          reason: "空草稿页现在可以显示建议，下一步可以确认加载失败和无建议时的轻量反馈。",
+          prompt: "请优化空白新对话页的建议加载失败和无建议状态，保持不阻塞输入并符合现有样式。",
+          generatedAt: Date.now(),
+        },
+      ];
+
+    case "cc_switch_get_config":
+      return { baseUrl: "http://127.0.0.1:15721" };
+
+    case "cc_switch_set_config":
+      return undefined;
+
+    case "router_set_mode":
+      return undefined;
+
+    case "assistant_ai_get_config":
+      return { baseUrl: null, apiKey: null, model: null };
+
+    case "assistant_ai_set_config":
+      return undefined;
+
+    case "assistant_ai_test_connection":
+      return {
+        ok: true,
+        error: null,
+        models: ["gpt-4o-mini"],
+        modelMatched: null,
+      };
+
     case "agent_timeline_list": {
+      if (agentTimelineDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, agentTimelineDelayMs));
+      }
       const taskId = String(args.taskId);
       return timelineEvents[taskId] ?? [];
     }
@@ -580,6 +1138,7 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
 
     case "chat_get_composer_state": {
       const taskId = String(args.taskId);
+      if (composerStateHandler) return composerStateHandler(taskId);
       return {
         taskId,
         backend: "claude",
@@ -588,6 +1147,185 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
         permission: "ask",
       };
     }
+
+    case "plugins_overview":
+      return {
+        claudeUserSkills: [
+          {
+            scope: "user",
+            name: "mock-skill",
+            description: "测试用 Skill",
+            enabled: true,
+            path: "C:\\Users\\mock\\.claude\\skills\\mock-skill\\SKILL.md",
+          },
+        ],
+        claudeProjectSkills: [],
+        claudeUserPlugins: claudePlugins.map((plugin) => ({ ...plugin })),
+        claudeMcpServers: claudeMcpServers.map((server) => ({
+          ...server,
+          args: [...server.args],
+          envKeys: [...server.envKeys],
+        })),
+        claudeMcpConfigPath: "C:\\Users\\mock\\.lilia\\config\\claude-mcp-servers.json",
+        codexMcpServers: codexMcpServers.map((server) => ({
+          ...server,
+          args: [...server.args],
+          envKeys: [...server.envKeys],
+        })),
+        codexConfigPath: "C:\\Users\\mock\\.codex\\config.toml",
+        warnings: [],
+      };
+
+    case "plugins_set_claude_plugin_enabled": {
+      const name = String(args.name);
+      const enabled = args.enabled === true;
+      claudePlugins = claudePlugins.map((plugin) =>
+        plugin.name === name ? { ...plugin, enabled } : plugin
+      );
+      return undefined;
+    }
+
+    case "plugins_create_claude_mcp_server": {
+      const input = args.input as {
+        name?: string;
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+      };
+      const server = {
+        name: String(input.name ?? ""),
+        command: String(input.command ?? ""),
+        args: Array.isArray(input.args) ? input.args.map(String) : [],
+        envKeys: Object.keys(input.env ?? {}),
+        enabled: true,
+      };
+      claudeMcpServers = [...claudeMcpServers, server];
+      return { ...server, args: [...server.args], envKeys: [...server.envKeys] };
+    }
+
+    case "plugins_update_claude_mcp_server": {
+      const name = String(args.name);
+      const input = args.input as {
+        name?: string;
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+        removeEnvKeys?: string[];
+      };
+      let updated = claudeMcpServers.find((server) => server.name === name);
+      if (!updated) return undefined;
+      const removed = new Set(
+        Array.isArray(input.removeEnvKeys) ? input.removeEnvKeys.map(String) : [],
+      );
+      const envKeys = input.env
+        ? [
+            ...updated.envKeys.filter((key) => !removed.has(key) && !(key in input.env!)),
+            ...Object.keys(input.env),
+          ]
+        : updated.envKeys.filter((key) => !removed.has(key));
+      updated = {
+        ...updated,
+        name: String(input.name ?? updated.name),
+        command: String(input.command ?? updated.command),
+        args: Array.isArray(input.args) ? input.args.map(String) : updated.args,
+        envKeys,
+      };
+      claudeMcpServers = claudeMcpServers.map((server) =>
+        server.name === name ? updated : server
+      );
+      return { ...updated, args: [...updated.args], envKeys: [...updated.envKeys] };
+    }
+
+    case "plugins_delete_claude_mcp_server": {
+      const name = String(args.name);
+      claudeMcpServers = claudeMcpServers.filter((server) => server.name !== name);
+      return undefined;
+    }
+
+    case "plugins_set_claude_mcp_server_enabled": {
+      const name = String(args.name);
+      const enabled = args.enabled === true;
+      claudeMcpServers = claudeMcpServers.map((server) =>
+        server.name === name ? { ...server, enabled } : server
+      );
+      return undefined;
+    }
+
+    case "plugins_open_claude_mcp_config":
+      return undefined;
+
+    case "plugins_create_codex_mcp_server": {
+      const input = args.input as {
+        name?: string;
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+      };
+      const server = {
+        name: String(input.name ?? ""),
+        command: String(input.command ?? ""),
+        args: Array.isArray(input.args) ? input.args.map(String) : [],
+        envKeys: Object.keys(input.env ?? {}),
+        enabled: true,
+        transport: "stdio",
+        editable: true,
+      };
+      codexMcpServers = [...codexMcpServers, server];
+      return { ...server, args: [...server.args], envKeys: [...server.envKeys] };
+    }
+
+    case "plugins_update_codex_mcp_server": {
+      const name = String(args.name);
+      const input = args.input as {
+        name?: string;
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+        removeEnvKeys?: string[];
+      };
+      let updated = codexMcpServers.find((server) => server.name === name);
+      if (!updated || !updated.editable) return undefined;
+      const removed = new Set(
+        Array.isArray(input.removeEnvKeys) ? input.removeEnvKeys.map(String) : [],
+      );
+      const envKeys = input.env
+        ? [
+            ...updated.envKeys.filter((key) => !removed.has(key) && !(key in input.env!)),
+            ...Object.keys(input.env),
+          ]
+        : updated.envKeys.filter((key) => !removed.has(key));
+      updated = {
+        ...updated,
+        name: String(input.name ?? updated.name),
+        command: String(input.command ?? updated.command),
+        args: Array.isArray(input.args) ? input.args.map(String) : updated.args,
+        envKeys,
+      };
+      codexMcpServers = codexMcpServers.map((server) =>
+        server.name === name ? updated : server
+      );
+      return { ...updated, args: [...updated.args], envKeys: [...updated.envKeys] };
+    }
+
+    case "plugins_delete_codex_mcp_server": {
+      const name = String(args.name);
+      codexMcpServers = codexMcpServers.filter((server) =>
+        server.name !== name || !server.editable
+      );
+      return undefined;
+    }
+
+    case "plugins_set_codex_mcp_server_enabled": {
+      const name = String(args.name);
+      const enabled = args.enabled === true;
+      codexMcpServers = codexMcpServers.map((server) =>
+        server.name === name && server.editable ? { ...server, enabled } : server
+      );
+      return undefined;
+    }
+
+    case "plugins_open_codex_config":
+      return undefined;
 
     case "chat_set_composer_state":
       return undefined;
@@ -599,51 +1337,309 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
       const settings = args.settings as {
         nonInterruptMode?: unknown;
         debug?: unknown;
+        codexProfile?: {
+          profile?: unknown;
+          model?: unknown;
+          reasoningEffort?: unknown;
+          runtimeWorkspaceRoots?: unknown;
+          permissions?: { profile?: unknown };
+        };
       } | undefined;
+      const codexProfile = settings?.codexProfile;
       agentInteractionSettings = {
         nonInterruptMode: settings?.nonInterruptMode === true,
         debug: settings?.debug === true,
+        codexProfile: {
+          profile: typeof codexProfile?.profile === "string" ? codexProfile.profile : "default",
+          model: typeof codexProfile?.model === "string" && codexProfile.model.trim()
+            ? codexProfile.model.trim()
+            : null,
+          reasoningEffort: typeof codexProfile?.reasoningEffort === "string"
+            ? codexProfile.reasoningEffort
+            : null,
+          runtimeWorkspaceRoots: Array.isArray(codexProfile?.runtimeWorkspaceRoots)
+            ? codexProfile.runtimeWorkspaceRoots.map(String)
+            : [],
+          permissions: {
+            profile: typeof codexProfile?.permissions?.profile === "string"
+              ? codexProfile.permissions.profile
+              : "default",
+          },
+        },
       };
       return undefined;
     }
 
     case "chat_list_models": {
       const backend = String(args.backend || "claude");
+      if (backend === "codex") {
+        return CODEX_MODEL_OPTIONS.map((option) => ({ ...option, backend }));
+      }
       return [
         {
-          id: backend === "codex" ? "gpt-5-codex" : "claude-sonnet-4-6",
-          label: backend === "codex" ? "GPT-5 Codex" : "Sonnet 4.6",
+          id: "claude-sonnet-4-6",
+          label: "Sonnet 4.6",
           backend,
         },
       ];
     }
 
-    case "chat_respond_ask_user":
-      return undefined;
-
-    case "chat_respond_tool_consent":
+    case "chat_respond_agent_interaction":
       return undefined;
 
     case "chat_describe_attachments": {
       const paths = Array.isArray(args.paths) ? args.paths.map(String) : [];
       return paths.map((path, index) => {
         const name = path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+        const lower = path.toLowerCase();
+        const exists = !lower.includes("missing") && !lower.includes("not-found");
+        const isImage = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path);
+        const isFile = path.includes(".") || isImage;
+        const isBigDir = lower.includes("big-dir") || lower.includes("大型目录");
         return {
           id: `att-${index + 1}`,
           name,
           path,
-          kind: path.includes(".") ? "file" : "directory",
-          size: path.includes(".") ? 42 : null,
+          kind: exists ? (isFile ? "file" : "directory") : "unknown",
+          size: exists && isFile ? 42 : null,
+          exists,
+          mime: exists && isImage ? "image/png" : null,
+          directory: exists && !isFile
+            ? {
+              fileCount: isBigDir ? 250 : 12,
+              directoryCount: isBigDir ? 18 : 2,
+              totalSize: isBigDir ? 24 * 1024 * 1024 : 4096,
+              truncated: isBigDir,
+              unreadableCount: 0,
+            }
+            : null,
         };
       });
     }
 
-    case "todo_list":
-      return [];
+    case "chat_read_clipboard_file_paths":
+      return [...clipboardFilePaths];
+
+    case "chat_save_clipboard_image": {
+      clipboardImageSeq += 1;
+      const input = args.input && typeof args.input === "object" && !Array.isArray(args.input)
+        ? args.input as Record<string, unknown>
+        : {};
+      const mime = typeof input.mime === "string" && input.mime.startsWith("image/")
+        ? input.mime
+        : "image/png";
+      const ext = mime === "image/jpeg"
+        ? "jpg"
+        : mime === "image/webp"
+          ? "webp"
+          : "png";
+      const path = `C:\\Users\\mock\\.lilia\\cache\\clipboard-images\\clipboard-${clipboardImageSeq}.${ext}`;
+      return {
+        id: `clip-${clipboardImageSeq}`,
+        name: `图片 ${clipboardImageSeq}.${ext}`,
+        path,
+        kind: "file",
+        size: 42,
+        exists: true,
+        mime,
+        directory: null,
+      };
+    }
+
+    case "chat_save_clipboard_text": {
+      clipboardTextSeq += 1;
+      const input = args.input && typeof args.input === "object" && !Array.isArray(args.input)
+        ? args.input as Record<string, unknown>
+        : {};
+      const text = typeof input.text === "string" ? input.text : "";
+      const path = `C:\\Users\\mock\\.lilia\\cache\\clipboard-texts\\clipboard-${clipboardTextSeq}.txt`;
+      return {
+        id: `clip-text-${clipboardTextSeq}`,
+        name: `粘贴文本 ${clipboardTextSeq}.txt`,
+        path,
+        kind: "file",
+        size: new TextEncoder().encode(text).length,
+        exists: true,
+        mime: null,
+        directory: null,
+      };
+    }
+
+    case "chat_search_context_attachments": {
+      const projectCwd = String(args.projectCwd ?? "D:\\PROJECT\\workspace\\Lilia");
+      const query = String(args.query ?? "").toLowerCase().replace(/\\/g, "/");
+      const limit = typeof args.limit === "number" ? args.limit : 12;
+      const pathMode = query.includes("/");
+      const allowHidden = query.includes(".");
+      const ignoredRoots = ["dist"];
+      const fixtures = [
+        { relativePath: "README.md", kind: "file" },
+        { relativePath: "apps", kind: "directory" },
+        { relativePath: "apps/desktop", kind: "directory" },
+        { relativePath: "apps/desktop/src/components/chat/ChatComposer.vue", kind: "file" },
+        { relativePath: "apps/desktop/src-tauri/src/lib.rs", kind: "file" },
+        { relativePath: "docs/design/memory.md", kind: "file" },
+        { relativePath: "screenshots/context-preview.png", kind: "file" },
+        { relativePath: "big-dir", kind: "directory" },
+        { relativePath: "big-dir/inside.md", kind: "file" },
+        { relativePath: ".env", kind: "file" },
+        { relativePath: ".github", kind: "directory" },
+        { relativePath: ".github/workflows", kind: "directory" },
+        { relativePath: "dist", kind: "directory" },
+        { relativePath: "dist/app.js", kind: "file" },
+      ];
+      const directParent = (() => {
+        if (!pathMode) return null;
+        const normalized = query.startsWith("./") ? query.slice(2) : query;
+        if (!normalized) return "";
+        if (normalized.endsWith("/")) return normalized.replace(/\/+$/, "");
+        return normalized.slice(0, normalized.lastIndexOf("/"));
+      })();
+      return fixtures
+        .filter(({ relativePath }) => {
+          const normalized = relativePath.toLowerCase();
+          const parts = normalized.split("/");
+          const name = parts.at(-1) ?? normalized;
+          if (!allowHidden && parts.some((part) => part.startsWith("."))) return false;
+          if (!pathMode && ignoredRoots.some((root) => normalized === root || normalized.startsWith(`${root}/`))) {
+            return false;
+          }
+          if (directParent !== null) {
+            const parent = parts.slice(0, -1).join("/");
+            if (parent !== directParent) return false;
+          }
+          if (!query) return true;
+          return normalized.includes(query) || name.includes(query);
+        })
+        .slice(0, limit)
+        .map(({ relativePath, kind }, index) => {
+          const path = `${projectCwd}\\${relativePath.replace(/\//g, "\\")}`;
+          const name = relativePath.split("/").at(-1) ?? relativePath;
+          const isImage = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(relativePath);
+          const isFile = kind === "file";
+          const isBigDir = relativePath === "big-dir";
+          return {
+            attachment: {
+              id: `ctx-${index + 1}`,
+              name,
+              path,
+              kind,
+              size: isFile ? 42 : null,
+              exists: true,
+              mime: isImage ? "image/png" : null,
+              directory: !isFile
+                ? {
+                  fileCount: isBigDir ? 250 : 12,
+                  directoryCount: isBigDir ? 18 : 2,
+                  totalSize: isBigDir ? 24 * 1024 * 1024 : 4096,
+                  truncated: isBigDir,
+                  unreadableCount: 0,
+                }
+                : null,
+            },
+            relativePath,
+            matchedBy: (name.toLowerCase().includes(query) ? "name" : "path"),
+          };
+        });
+    }
+
+    case "todo_list": {
+      const taskId = String(args.taskId);
+      return listMockTodos(taskId);
+    }
+
+    case "todo_create": {
+      const taskId = String(args.taskId);
+      const text = String(args.text ?? "").trim();
+      const now = Date.now();
+      const order = (todosByTaskId[taskId] ?? []).reduce(
+        (max, todo) => Math.max(max, todo.order),
+        -1,
+      ) + 1;
+      const todo: TodoRow = {
+        id: nextTodoId(),
+        taskId,
+        text,
+        done: false,
+        order,
+        source: "lilia",
+        priority: normalizeTodoPriority(args.priority),
+        guideStatus: "pending",
+        attachments: Array.isArray(args.attachments) ? args.attachments : [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      todosByTaskId[taskId] = [...(todosByTaskId[taskId] ?? []), todo];
+      emitTauriEvent("todo-changed", { taskId });
+      return cloneTodo(todo);
+    }
+
+    case "todo_update": {
+      const id = String(args.id);
+      const now = Date.now();
+      for (const taskId of Object.keys(todosByTaskId)) {
+        let changed = false;
+        todosByTaskId[taskId] = todosByTaskId[taskId].map((todo) => {
+          if (todo.id !== id) return todo;
+          if (todo.source !== "lilia") return todo;
+          changed = true;
+          return {
+            ...todo,
+            text: typeof args.text === "string" ? args.text : todo.text,
+            done: typeof args.done === "boolean" ? args.done : todo.done,
+            order: typeof args.order === "number" ? args.order : todo.order,
+            priority: args.priority === "high" || args.priority === "normal" || args.priority === "low"
+              ? args.priority
+              : todo.priority,
+            guideStatus: args.guideStatus === "pending" ||
+              args.guideStatus === "queued" ||
+              args.guideStatus === "sent"
+              ? args.guideStatus
+              : todo.guideStatus,
+            updatedAt: now,
+          };
+        });
+        if (changed) {
+          emitTauriEvent("todo-changed", { taskId });
+          break;
+        }
+      }
+      return undefined;
+    }
+
+    case "todo_delete": {
+      const id = String(args.id);
+      for (const taskId of Object.keys(todosByTaskId)) {
+        const before = todosByTaskId[taskId].length;
+        todosByTaskId[taskId] = todosByTaskId[taskId].filter((todo) =>
+          todo.id !== id || todo.source !== "lilia"
+        );
+        if (todosByTaskId[taskId].length !== before) {
+          emitTauriEvent("todo-changed", { taskId });
+          break;
+        }
+      }
+      return undefined;
+    }
+
+    case "todo_apply_agent_event": {
+      const taskId = String(args.taskId);
+      const todos = Array.isArray(args.todos) ? args.todos : [];
+      const updated = applyMockAgentTodos(taskId, todos);
+      emitTauriEvent("todo-changed", { taskId });
+      return updated;
+    }
 
     case "chat_send_message": {
+      if (nextChatSendError) {
+        const message = nextChatSendError;
+        nextChatSendError = null;
+        throw new Error(message);
+      }
       const taskId = String(args.taskId);
       const content = String(args.content);
+      const composer = normalizeComposer(args.composer, taskId);
+      args.composer = composer;
       const attachments = Array.isArray(args.attachments) ? args.attachments : [];
       const queued = chatRunning[taskId] === true;
       const message = {
@@ -661,6 +1657,7 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
         id: message.id,
         turnId,
         kind: "message",
+        backend: composer.backend,
         status: queued ? "pending" : "success",
         title: "用户输入",
         summary: content,
@@ -676,6 +1673,7 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
         intraTurnOrder: 0,
       });
       if (queued) {
+        setMockGuideStatus(args.guideId, "queued");
         chatQueued[taskId] = [...(chatQueued[taskId] ?? []), args];
         return {
           message,
@@ -683,6 +1681,7 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
           queuedCount: chatQueued[taskId].length,
         };
       }
+      setMockGuideStatus(args.guideId, "sent");
       chatRunning[taskId] = true;
       queueMicrotask(() => {
         emitTauriEvent("chat:turn-started", {
@@ -701,16 +1700,18 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
       const taskId = String(args.taskId);
       const turnId = currentChatTurnId(taskId);
       const message = "用户打断了当前 Agent 运行";
+      resetMockQueuedGuides(chatQueued[taskId]);
       chatQueued[taskId] = [];
       if (chatRunning[taskId] === true) {
         emitMockTimelineEvent(taskId, {
           id: `tl-interrupted-${turnId}`,
+          backend: activeBackend,
           kind: "error",
           status: "error",
           title: "Agent 已打断",
           summary: message,
           payload: {
-            backend: "claude",
+            backend: activeBackend,
             interrupted: true,
             message,
           },
@@ -725,6 +1726,14 @@ export const mockInvoke = vi.fn(async (cmd: string, args: Record<string, unknown
           });
         });
       }
+      return undefined;
+    }
+
+    case "chat_reset_session": {
+      const taskId = String(args.taskId);
+      resetMockQueuedGuides(chatQueued[taskId]);
+      chatQueued[taskId] = [];
+      chatRunning[taskId] = false;
       return undefined;
     }
 

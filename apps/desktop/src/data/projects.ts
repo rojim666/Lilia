@@ -18,6 +18,8 @@ interface ProjectRow {
 }
 
 export const PROJECTS = ref<Project[]>([]);
+const projectsLoaded = ref(false);
+let projectLoad: Promise<void> | null = null;
 let onProjectRemoved:
   | ((projectId: string) => void | Promise<void>)
   | null = null;
@@ -30,17 +32,45 @@ export function registerProjectRemovalHandler(
 
 export async function refresh(): Promise<void> {
   const rows = await invoke<ProjectRow[]>("project_list");
-  PROJECTS.value = rows.map((r) => ({
+  PROJECTS.value = rows.map(projectRowToProject);
+  projectsLoaded.value = true;
+}
+
+function projectRowToProject(r: ProjectRow): Project {
+  return {
     id: r.id,
     name: r.name,
     cwd: r.cwd,
     sessionCount: r.sessionCount,
     pinned: r.pinned,
-  }));
+  };
 }
 
-// 模块加载时立刻拉一次；调用方可 await 确保数据就绪。
-export const projectsReady: Promise<void> = refresh();
+function upsertProject(project: Project): Project {
+  const index = PROJECTS.value.findIndex((p) => p.id === project.id);
+  if (index === -1) {
+    PROJECTS.value = [...PROJECTS.value, project];
+    return project;
+  }
+  const next = [...PROJECTS.value];
+  next[index] = project;
+  PROJECTS.value = next;
+  return project;
+}
+
+function shouldDeferInitialRefresh(): boolean {
+  return typeof window !== "undefined" && window.location.hash.startsWith("#/popup");
+}
+
+export function ensureProjectsLoaded(force = false): Promise<void> {
+  if (shouldDeferInitialRefresh()) return Promise.resolve();
+  if (!force && projectsLoaded.value) return Promise.resolve();
+  if (!force && projectLoad) return projectLoad;
+  projectLoad = refresh().finally(() => {
+    projectLoad = null;
+  });
+  return projectLoad;
+}
 
 export function listProjects(): Project[] {
   return PROJECTS.value;
@@ -48,6 +78,14 @@ export function listProjects(): Project[] {
 
 export function getProject(id: string): Project | undefined {
   return PROJECTS.value.find((p) => p.id === id);
+}
+
+export async function ensureProjectLoaded(id: string): Promise<Project | null> {
+  const existing = getProject(id);
+  if (existing) return existing;
+  const row = await invoke<ProjectRow | null>("project_get", { id });
+  if (!row) return null;
+  return upsertProject(projectRowToProject(row));
 }
 
 /**
@@ -63,15 +101,7 @@ export async function createProject(input: {
     name: trimmedName || "未命名项目",
     cwd: input.cwd && input.cwd.trim() ? input.cwd.trim() : null,
   });
-  const project: Project = {
-    id: row.id,
-    name: row.name,
-    cwd: row.cwd,
-    sessionCount: row.sessionCount,
-    pinned: row.pinned,
-  };
-  PROJECTS.value = [...PROJECTS.value, project];
-  return project;
+  return upsertProject(projectRowToProject(row));
 }
 
 /** 更新项目名称；trim 后为空时不改动。返回是否真正更新。 */

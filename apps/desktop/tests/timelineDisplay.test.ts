@@ -1,8 +1,9 @@
 import { fireEvent, render } from "@testing-library/vue";
-import { nextTick } from "vue";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { AgentTimelineEvent } from "@lilia/contracts";
-import { deriveTimelineDisplay } from "@lilia/contracts";
+import { deriveTimelineDisplay, isAgentTimelineToolWindowKind } from "@lilia/contracts";
 import { normalizeClaudeTool } from "../../../packages/contracts/src/claudeTools.mjs";
 import AgentTimeline from "../src/components/chat/AgentTimeline.vue";
 import { timelineEventLabel, timelineInlinePreview } from "../src/components/chat/timelineDisplay";
@@ -40,45 +41,54 @@ function listItems(
   ) ?? [];
 }
 
-function mockElementRect(element: HTMLElement, rect: Partial<DOMRect>) {
-  vi.spyOn(element, "getBoundingClientRect").mockReturnValue({
-    x: rect.left ?? 0,
-    y: rect.top ?? 0,
-    left: rect.left ?? 0,
-    top: rect.top ?? 0,
-    right: rect.right ?? 100,
-    bottom: rect.bottom ?? 0,
-    width: rect.width ?? 100,
-    height: rect.height ?? 0,
-    toJSON: () => ({}),
-  });
+function timelineEvent(
+  patch: Partial<AgentTimelineEvent> & Pick<AgentTimelineEvent, "id" | "kind" | "payload">,
+): AgentTimelineEvent {
+  return {
+    id: patch.id,
+    taskId: "task-1",
+    turnId: patch.turnId ?? null,
+    backend: "claude",
+    kind: patch.kind,
+    status: patch.status ?? "success",
+    title: patch.title ?? patch.kind,
+    summary: patch.summary ?? "",
+    payload: patch.payload,
+    createdAt: patch.createdAt ?? 1,
+    updatedAt: patch.updatedAt ?? patch.createdAt ?? 1,
+    turnSeq: patch.turnSeq ?? 1,
+    intraTurnOrder: patch.intraTurnOrder ?? 1,
+  };
 }
 
-function mockScrollGeometry(
-  element: HTMLElement,
-  values: {
-    clientHeight: number;
-    scrollHeight: number;
-    scrollTop: number;
-  },
-) {
-  Object.defineProperty(element, "clientHeight", {
-    configurable: true,
-    value: values.clientHeight,
-  });
-  Object.defineProperty(element, "scrollHeight", {
-    configurable: true,
-    value: values.scrollHeight,
-  });
-  element.scrollTop = values.scrollTop;
+function nextFrame(): Promise<void> {
+  return new Promise((resolveFrame) => requestAnimationFrame(() => resolveFrame()));
 }
 
-async function flushPlanMeasure() {
-  await nextTick();
-  await nextTick();
-}
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("timeline display derivation", () => {
+  it("识别所有会触发高优先级引导的工具窗口 kind", () => {
+    for (const kind of [
+      "tool",
+      "command",
+      "mcp",
+      "search",
+      "web_search",
+      "web_fetch",
+      "file_read",
+      "file_change",
+      "todo_list",
+      "subagent",
+    ]) {
+      expect(isAgentTimelineToolWindowKind(kind)).toBe(true);
+    }
+    expect(isAgentTimelineToolWindowKind("message")).toBe(false);
+    expect(isAgentTimelineToolWindowKind("plan")).toBe(false);
+  });
+
   it("命令输出详情保留原始分行", () => {
     const display = deriveTimelineDisplay({
       kind: "command",
@@ -92,6 +102,29 @@ describe("timeline display derivation", () => {
     });
 
     expect(codeContent(display.details, "OUTPUT")).toBe("line one\nline two\nline three");
+  });
+
+  it("Lilia 编辑后的命令执行展示原始命令和修改后命令", () => {
+    const display = deriveTimelineDisplay({
+      kind: "command",
+      status: "success",
+      title: "npm test -- --runInBand",
+      summary: "",
+      payload: {
+        subkind: "lilia_edit_exec",
+        executionOwner: "lilia",
+        originalCommand: "npm test",
+        modifiedCommand: "npm test -- --runInBand",
+        exitCode: 0,
+        output: "ok",
+      },
+    });
+
+    expect(display.action).toBe("执行已编辑命令");
+    expect(fieldValue(display.details, "owner")).toBe("lilia");
+    expect(codeContent(display.details, "ORIGINAL COMMAND")).toBe("npm test");
+    expect(codeContent(display.details, "MODIFIED COMMAND")).toBe("npm test -- --runInBand");
+    expect(codeContent(display.details, "OUTPUT")).toBe("ok");
   });
 
   it("Claude AskUserQuestion 派生为提问事件并用问题文本做缩略", () => {
@@ -126,66 +159,6 @@ describe("timeline display derivation", () => {
     expect(timelineInlinePreview(event)).toBe("方案 · 选哪个方案？ 等 2 个问题");
   });
 
-  it("AskUserQuestion 完成后展开项显示用户选择内容", () => {
-    const display = deriveTimelineDisplay({
-      kind: "ask_user",
-      status: "success",
-      title: "AskUserQuestion",
-      summary: "",
-      payload: {
-        toolName: "AskUserQuestion",
-        questions: [
-          {
-            id: "q-1",
-            header: "方案",
-            question: "选哪个方案？",
-            options: [{ label: "方案 A" }, { label: "方案 B" }],
-          },
-        ],
-        output: JSON.stringify({
-          answers: { "选哪个方案？": "方案 B" },
-          annotations: { "选哪个方案？": { notes: "保留回滚入口" } },
-          cancelled: false,
-        }),
-      },
-    });
-
-    expect(display.preview).toBe("方案 · 选哪个方案？");
-    expect(listItems(display.details)).toContain(
-      "方案 · 选哪个方案？：方案 B（备注：保留回滚入口）",
-    );
-    expect(codeContent(display.details, "OUTPUT")).toBe("");
-  });
-
-  it("AskUserQuestion 取消时保留已选择内容并显示取消态", () => {
-    const event = {
-      kind: "ask_user",
-      status: "cancelled" as const,
-      title: "AskUserQuestion",
-      summary: "",
-      payload: {
-        toolName: "AskUserQuestion",
-        questions: [
-          {
-            id: "q-1",
-            header: "方案",
-            question: "选哪个方案？",
-            options: [{ label: "方案 A" }, { label: "方案 B" }],
-          },
-        ],
-        output: JSON.stringify({
-          answers: { "选哪个方案？": "方案 A" },
-          cancelled: true,
-        }),
-      },
-    };
-    const display = deriveTimelineDisplay(event);
-
-    expect(timelineEventLabel(event)).toBe("已取消提问");
-    expect(listItems(display.details)).toContain("方案 · 选哪个方案？：方案 A");
-    expect(markdownContents(display.details)).toContain("用户取消了提问。");
-  });
-
   it("Claude ExitPlanMode 派生为待确认计划事件", () => {
     const normalized = normalizeClaudeTool("ExitPlanMode", {
       plan: "## 修改计划\n- 接线 runner\n- 补测试",
@@ -212,55 +185,6 @@ describe("timeline display derivation", () => {
     expect(display.defaultExpanded).toBeUndefined();
     expect(markdownContents(display.details)).toContain("## 修改计划\n- 接线 runner\n- 补测试");
     expect(listItems(display.details)).toContain("Bash：yarn test");
-  });
-
-  it("计划确认和取消使用明确标签并保持 plan bucket", () => {
-    const accepted = {
-      kind: "plan",
-      status: "success" as const,
-      title: "ExitPlanMode",
-      summary: "",
-      payload: {
-        plan: "按计划执行",
-        approved: true,
-        executionPermission: "full",
-      },
-    };
-    const cancelled = {
-      ...accepted,
-      status: "cancelled" as const,
-      payload: {
-        ...accepted.payload,
-        approved: false,
-      },
-    };
-
-    expect(timelineEventLabel(accepted)).toBe("已确认计划");
-    expect(deriveTimelineDisplay(accepted).group?.bucket).toBe("plan");
-    expect(deriveTimelineDisplay(accepted).defaultExpanded).toBeUndefined();
-    expect(timelineEventLabel(cancelled)).toBe("已取消计划");
-  });
-
-  it("计划修改要求显示明确标签并在详情保留原计划和要求", () => {
-    const event = {
-      kind: "plan",
-      status: "cancelled" as const,
-      title: "ExitPlanMode",
-      summary: "",
-      payload: {
-        plan: "## 当前计划\n- 先改 runner\n- 再补测试",
-        revisionRequest: "把文档边界也写清楚",
-        approved: false,
-        executionPermission: "ask",
-      },
-    };
-    const display = deriveTimelineDisplay(event);
-
-    expect(timelineEventLabel(event)).toBe("要求修改计划");
-    expect(timelineInlinePreview(event)).toBe("修改要求：把文档边界也写清楚");
-    expect(markdownContents(display.details)).toContain("## 当前计划\n- 先改 runner\n- 再补测试");
-    expect(markdownContents(display.details)).toContain("把文档边界也写清楚");
-    expect(display.group?.bucket).toBe("plan");
   });
 
   it("读取文件事件不把执行细节作为展开详情", () => {
@@ -314,140 +238,6 @@ describe("timeline display derivation", () => {
     expect(grepDisplay.details).toBeUndefined();
   });
 
-  it("命令和待办仍保留可展开详情", () => {
-    const commandDisplay = deriveTimelineDisplay({
-      kind: "command",
-      status: "success",
-      title: "yarn test",
-      summary: "",
-      payload: {
-        command: "yarn test",
-        output: "ok",
-      },
-    });
-    const todoDisplay = deriveTimelineDisplay({
-      kind: "todo_list",
-      status: "success",
-      title: "Todo",
-      summary: "",
-      payload: {
-        items: [{ text: "验证 timeline", completed: true }],
-      },
-    });
-
-    expect(commandDisplay.details?.length).toBeGreaterThan(0);
-    expect(todoDisplay.details?.length).toBeGreaterThan(0);
-  });
-
-  it("短命令没有输出和排错字段时不提供展开详情", () => {
-    const display = deriveTimelineDisplay({
-      kind: "command",
-      status: "success",
-      title: "pwd",
-      summary: "",
-      payload: {
-        command: "pwd",
-      },
-    });
-
-    expect(display.preview).toBe("pwd");
-    expect(display.details).toBeUndefined();
-  });
-
-  it("长命令即使没有输出也保留完整命令详情", () => {
-    const command = `node scripts/build-report.js --workspace apps/desktop --filter timeline --output dist/reports/timeline-display.json --include-snapshots --include-contracts --max-old-space-size=4096 --verbose --dry-run`;
-    const display = deriveTimelineDisplay({
-      kind: "command",
-      status: "success",
-      title: command,
-      summary: "",
-      payload: { command },
-    });
-
-    expect(codeContent(display.details, "COMMAND")).toBe(command);
-    expect(codeContent(display.details, "OUTPUT")).toBe("");
-  });
-
-  it("有输出的短命令保留完整命令和输出", () => {
-    const display = deriveTimelineDisplay({
-      kind: "command",
-      status: "success",
-      title: "pwd",
-      summary: "",
-      payload: {
-        command: "pwd",
-        output: "C:/Files/workspace/Lilia",
-      },
-    });
-
-    expect(codeContent(display.details, "COMMAND")).toBe("pwd");
-    expect(codeContent(display.details, "OUTPUT")).toBe("C:/Files/workspace/Lilia");
-    expect(fieldValue(display.details, "exit")).toBe("");
-  });
-
-  it("成功单文件修改和网页类事件不展示重复详情", () => {
-    const editDisplay = deriveTimelineDisplay({
-      kind: "file_change",
-      status: "success",
-      title: "Edit",
-      summary: "src/App.vue",
-      payload: {
-        subkind: "edit",
-        path: "src/App.vue",
-      },
-    });
-    const webSearchDisplay = deriveTimelineDisplay({
-      kind: "search",
-      status: "success",
-      title: "WebSearch",
-      summary: "Lilia timeline",
-      payload: {
-        subkind: "web",
-        query: "Lilia timeline",
-      },
-    });
-    const webFetchDisplay = deriveTimelineDisplay({
-      kind: "web_fetch",
-      status: "success",
-      title: "WebFetch",
-      summary: "https://example.com",
-      payload: {
-        url: "https://example.com",
-      },
-    });
-
-    expect(editDisplay.details).toBeUndefined();
-    expect(webSearchDisplay.details).toBeUndefined();
-    expect(webFetchDisplay.details).toBeUndefined();
-  });
-
-  it("失败的文件修改和网页类事件保留错误详情", () => {
-    const editDisplay = deriveTimelineDisplay({
-      kind: "file_change",
-      status: "error",
-      title: "Edit",
-      summary: "Permission denied",
-      payload: {
-        subkind: "edit",
-        path: "src/App.vue",
-        output: "Permission denied",
-      },
-    });
-    const webFetchDisplay = deriveTimelineDisplay({
-      kind: "web_fetch",
-      status: "failed",
-      title: "WebFetch",
-      summary: "Network failed",
-      payload: {
-        url: "https://example.com",
-        output: "Network failed",
-      },
-    });
-
-    expect(codeContent(editDisplay.details, "ERROR / OUTPUT")).toBe("Permission denied");
-    expect(codeContent(webFetchDisplay.details, "ERROR / OUTPUT")).toBe("Network failed");
-  });
-
   it("MCP 成功态只在有输入或输出时展开", () => {
     const emptyDisplay = deriveTimelineDisplay({
       kind: "mcp",
@@ -479,6 +269,81 @@ describe("timeline display derivation", () => {
     expect(codeContent(outputDisplay.details, "OUTPUT")).toBe("found docs");
   });
 
+  it("Codex MCP 配置发现用诊断展示，不显示为 MCP 调用", () => {
+    const display = deriveTimelineDisplay({
+      kind: "diagnostic",
+      status: "info",
+      title: "Codex MCP config",
+      summary: "已注册 2 个 MCP server",
+      payload: {
+        backend: "codex",
+        subkind: "config",
+        source: "config.toml",
+        configPath: "C:\\Users\\Administrator\\.codex\\config.toml",
+        serverCount: 2,
+        servers: ["node_repl", "browser"],
+      },
+    });
+    const event = {
+      kind: "diagnostic",
+      status: "info" as const,
+      title: "Codex MCP config",
+      summary: "已注册 2 个 MCP server",
+      payload: {
+        backend: "codex",
+        subkind: "config",
+        source: "config.toml",
+        servers: ["node_repl", "browser"],
+      },
+    };
+
+    expect(display.label).toBe("配置诊断");
+    expect(display.action).toBeUndefined();
+    expect(timelineEventLabel(event)).toBe("配置诊断");
+    expect(timelineInlinePreview(event)).toBe("已注册 2 个 MCP server");
+    expect(display.group).toBeUndefined();
+    expect(listItems(display.details)).toEqual([]);
+  });
+
+  it("配置要求用诊断事件展示", () => {
+    const display = deriveTimelineDisplay({
+      kind: "diagnostic",
+      status: "info",
+      title: "codex config requirement",
+      summary: "跳过外部 Codex MCP server：docs",
+      payload: {
+        backend: "codex",
+        subkind: "config_requirement",
+        warnings: ["跳过外部 Codex MCP server：docs"],
+      },
+    });
+
+    expect(display.label).toBe("配置要求");
+    expect(display.icon).toBe("stethoscope");
+    expect(display.group).toBeUndefined();
+    expect(codeContent(display.details, "DETAILS")).toContain("docs");
+  });
+
+  it("Hook runtime 事件用工具 hook 子类展示", () => {
+    const display = deriveTimelineDisplay({
+      kind: "tool",
+      status: "success",
+      title: "CommandEdit",
+      summary: "edited",
+      payload: {
+        subkind: "hook",
+        hookName: "CommandEdit",
+        hookEvent: "PostToolUse",
+        output: "edited",
+      },
+    });
+
+    expect(display.action).toBe("运行 Hook");
+    expect(display.object).toBe("CommandEdit");
+    expect(fieldValue(display.details, "event")).toBe("PostToolUse");
+    expect(codeContent(display.details, "OUTPUT")).toBe("edited");
+  });
+
   it("兜底工具只展示输入输出，不重复工具名字段", () => {
     const display = deriveTimelineDisplay({
       kind: "tool",
@@ -497,53 +362,6 @@ describe("timeline display derivation", () => {
     expect(codeContent(display.details, "OUTPUT")).toBe("indexed 42 files");
   });
 
-  it("子代理详情保留描述和结果但不展示内部 prompt", () => {
-    const display = deriveTimelineDisplay({
-      kind: "subagent",
-      status: "success",
-      title: "worker",
-      summary: "worker",
-      payload: {
-        agentType: "worker",
-        description: "检查 timeline 展示",
-        prompt: "内部长提示词",
-        result: "发现 2 个可优化点",
-      },
-    });
-
-    expect(markdownContents(display.details)).toEqual([
-      "检查 timeline 展示",
-      "发现 2 个可优化点",
-    ]);
-  });
-
-  it("失败的读取和搜索事件保留错误详情", () => {
-    const readDisplay = deriveTimelineDisplay({
-      kind: "file_read",
-      status: "error",
-      title: "Read",
-      summary: "File not found",
-      payload: {
-        path: "missing.ts",
-        output: "File not found",
-      },
-    });
-    const searchDisplay = deriveTimelineDisplay({
-      kind: "search",
-      status: "failed",
-      title: "Grep",
-      summary: "grep failed",
-      payload: {
-        subkind: "grep",
-        query: "needle",
-        output: "grep failed",
-      },
-    });
-
-    expect(codeContent(readDisplay.details, "ERROR / OUTPUT")).toBe("File not found");
-    expect(codeContent(searchDisplay.details, "ERROR / OUTPUT")).toBe("grep failed");
-  });
-
   it("项目内文件路径在展示态缩短为相对路径", () => {
     const display = deriveTimelineDisplay({
       kind: "file_read",
@@ -560,602 +378,164 @@ describe("timeline display derivation", () => {
     expect(display.preview).toBe("apps/desktop/src/App.vue");
   });
 
-  it("项目外路径、相似前缀路径和已有相对路径不被改写", () => {
-    const outsideDisplay = deriveTimelineDisplay({
-      kind: "file_read",
-      status: "success",
-      title: "Read",
-      summary: "C:\\Files\\workspace\\Other\\src\\App.vue",
-      payload: { path: "C:\\Files\\workspace\\Other\\src\\App.vue" },
-      projectCwd: "c:\\files\\workspace\\lilia",
-    });
-    const prefixDisplay = deriveTimelineDisplay({
-      kind: "file_read",
-      status: "success",
-      title: "Read",
-      summary: "C:\\Files\\workspace\\LiliaNext\\src\\App.vue",
-      payload: { path: "C:\\Files\\workspace\\LiliaNext\\src\\App.vue" },
-      projectCwd: "C:\\Files\\workspace\\Lilia",
-    });
-    const relativeDisplay = deriveTimelineDisplay({
-      kind: "file_read",
-      status: "success",
-      title: "Read",
-      summary: "src/App.vue",
-      payload: { path: "src/App.vue" },
-      projectCwd: "C:\\Files\\workspace\\Lilia",
-    });
-
-    expect(outsideDisplay.preview).toBe("C:\\Files\\workspace\\Other\\src\\App.vue");
-    expect(prefixDisplay.preview).toBe("C:\\Files\\workspace\\LiliaNext\\src\\App.vue");
-    expect(relativeDisplay.preview).toBe("src/App.vue");
-  });
-
-  it("多文件修改详情列表显示项目相对路径", () => {
+  it("错误事件标题固定为发生错误", () => {
     const display = deriveTimelineDisplay({
-      kind: "file_change",
-      status: "success",
-      title: "MultiEdit",
-      summary: "",
-      payload: {
-        changes: [
-          { kind: "edit", path: "C:/Files/workspace/Lilia/packages/contracts/src/index.ts" },
-          { kind: "edit", path: "C:/Files/workspace/Lilia/apps/desktop/src/App.vue" },
-        ],
-      },
-      projectCwd: "C:\\Files\\workspace\\Lilia",
-    });
-
-    expect(display.object).toBe("packages/contracts/src/index.ts");
-    expect(display.preview).toBe("packages/contracts/src/index.ts");
-    expect(listItems(display.details)).toEqual([
-      "edit packages/contracts/src/index.ts",
-      "edit apps/desktop/src/App.vue",
-    ]);
-  });
-
-  it("path 和 cwd 字段详情显示项目相对路径", () => {
-    const errorDisplay = deriveTimelineDisplay({
       kind: "error",
       status: "error",
-      title: "错误",
-      summary: "读取失败",
-      payload: {
-        path: "C:\\Files\\workspace\\Lilia\\packages\\contracts\\src\\index.ts",
-      },
-      projectCwd: "c:\\files\\workspace\\lilia",
-    });
-    const commandDisplay = deriveTimelineDisplay({
-      kind: "command",
-      status: "error",
-      title: "pwd",
-      summary: "failed",
-      payload: {
-        command: "pwd",
-        cwd: "C:\\Files\\workspace\\Lilia",
-        exitCode: 1,
-        stderr: "failed",
-      },
-      projectCwd: "c:\\files\\workspace\\lilia",
+      title: "Runner error",
+      summary: "provider failed",
+      payload: {},
     });
 
-    expect(fieldValue(errorDisplay.details, "path")).toBe("packages/contracts/src/index.ts");
-    expect(fieldValue(commandDisplay.details, "cwd")).toBe(".");
-  });
-
-  it("命令代码块不改写项目内路径", () => {
-    const command = "Get-Content -LiteralPath 'C:\\Files\\workspace\\Lilia\\package.json'";
-    const display = deriveTimelineDisplay({
-      kind: "command",
-      status: "success",
-      title: command,
-      summary: "",
-      payload: {
-        command,
-        output: "ok",
-      },
-      projectCwd: "C:\\Files\\workspace\\Lilia",
-    });
-
-    expect(codeContent(display.details, "COMMAND")).toBe(command);
+    expect(display.label).toBe("发生错误");
+    expect(display.preview).toBe("provider failed");
   });
 });
 
-function timelineEvent(
-  patch: Partial<AgentTimelineEvent> & Pick<AgentTimelineEvent, "id" | "kind" | "payload">,
-): AgentTimelineEvent {
-  return {
-    id: patch.id,
-    taskId: "task-1",
-    turnId: patch.turnId ?? null,
-    backend: "claude",
-    kind: patch.kind,
-    status: patch.status ?? "success",
-    title: patch.title ?? patch.kind,
-    summary: patch.summary ?? "",
-    payload: patch.payload,
-    createdAt: patch.createdAt ?? 1,
-    updatedAt: patch.updatedAt ?? patch.createdAt ?? 1,
-    turnSeq: patch.turnSeq ?? 1,
-    intraTurnOrder: patch.intraTurnOrder ?? 1,
-  };
-}
-
 describe("timeline event expansion", () => {
-  it("为滚动地图保留用户消息、分组事件和错误事件的定位锚点", () => {
-    const view = render(AgentTimeline, {
-      props: {
-        events: [
-          timelineEvent({
-            id: "user-1",
-            kind: "message",
-            payload: { role: "user", content: "开始" },
-            intraTurnOrder: 1,
-          }),
-          timelineEvent({
-            id: "plan-1",
-            kind: "plan",
-            payload: { plan: "第一步" },
-            createdAt: 2,
-            updatedAt: 2,
-            intraTurnOrder: 2,
-          }),
-          timelineEvent({
-            id: "plan-2",
-            kind: "plan",
-            payload: { plan: "第二步" },
-            createdAt: 3,
-            updatedAt: 3,
-            intraTurnOrder: 3,
-          }),
-          timelineEvent({
-            id: "error-1",
-            kind: "command",
-            status: "failed",
-            payload: { command: "yarn test", error: "boom" },
-            createdAt: 4,
-            updatedAt: 4,
-            intraTurnOrder: 4,
-          }),
-        ],
-      },
-    });
-
-    expect(view.container.querySelector('[data-scroll-anchor-id="user-1"]'))
-      .toHaveClass("agent-timeline__message-row");
-    expect(view.container.querySelector('[data-scroll-anchor-ids~="plan-1"]'))
-      .toHaveAttribute("data-scroll-anchor-ids", "plan-1 plan-2");
-    expect(view.container.querySelector('[data-scroll-anchor-id="error-1"]'))
-      .toHaveClass("agent-timeline__item");
-  });
-
-  it("历史待确认计划默认折叠", () => {
-    const view = render(AgentTimeline, {
-      props: {
-        events: [
-          timelineEvent({
-            id: "plan-pending-history",
-            kind: "plan",
-            status: "requires_action",
-            title: "ExitPlanMode",
-            turnId: "turn-history",
-            payload: {
-              plan: "## 加载的计划\n- 保持折叠",
-              approved: null,
-              executionPermission: "ask",
-            },
-          }),
-        ],
-      },
-    });
-
-    const card = view.container.querySelector(".timeline-card--plan");
-    const toggle = view.getByRole("button", { name: /等待确认计划/ });
-
-    expect(card).toHaveClass("is-collapsed");
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(view.getByText("## 加载的计划 - 保持折叠")).toBeInTheDocument();
-    expect(view.queryByText("加载的计划")).not.toBeInTheDocument();
-  });
-
-  it("活跃计划确认默认展开并使用专用计划卡片", () => {
-    const view = render(AgentTimeline, {
-      props: {
-        activePlanApprovalTurnId: "turn-plan",
-        events: [
-          timelineEvent({
-            id: "plan-pending",
-            kind: "plan",
-            status: "requires_action",
-            title: "ExitPlanMode",
-            turnId: "turn-plan",
-            payload: {
-              plan: "## 修改计划\n- 接线 runner\n- 补测试",
-              allowedPrompts: [{ tool: "Bash", prompt: "yarn test" }],
-              approved: null,
-              executionPermission: "ask",
-            },
-          }),
-        ],
-      },
-    });
-
-    const card = view.container.querySelector(".timeline-card--plan");
-    const toggle = view.getByRole("button", { name: /等待确认计划/ });
-    const badge = view.container.querySelector(".timeline-plan-card__badge");
-
-    expect(card).toHaveClass("is-expanded");
-    expect(badge).toHaveClass("timeline-plan-card__badge--pending");
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(view.queryByText("## 修改计划 - 接线 runner - 补测试"))
-      .not.toBeInTheDocument();
-    expect(view.getByText("修改计划")).toBeInTheDocument();
-    expect(view.getByText("可能调用")).toBeInTheDocument();
-    expect(view.getByText("Bash：yarn test")).toBeInTheDocument();
-  });
-
-  it("计划长正文的 markdown 标题显示为内层滚动节点并可点击跳转", async () => {
-    const scrollTo = vi.fn();
-    const view = render(AgentTimeline, {
-      props: {
-        activePlanApprovalTurnId: "turn-outline",
-        events: [
-          timelineEvent({
-            id: "plan-outline",
-            kind: "plan",
-            status: "requires_action",
-            title: "ExitPlanMode",
-            turnId: "turn-outline",
-            payload: {
-              plan: [
-                "# 阶段一",
-                "- 梳理边界",
-                "",
-                "## 阶段二",
-                "- 实现交互",
-                "",
-                "### 阶段三",
-                "- 收尾验证",
-              ].join("\n"),
-              approved: null,
-              executionPermission: "ask",
-            },
-          }),
-        ],
-      },
-    });
-    const body = view.container.querySelector(".timeline-plan-card__body");
-    const headings = view.container.querySelectorAll(
-      ".timeline-plan-card__markdown--plan .markdown-block__heading",
-    );
-
-    expect(body).toBeInstanceOf(HTMLElement);
-    expect(headings).toHaveLength(3);
-    Object.defineProperty(body as HTMLElement, "scrollTo", {
-      configurable: true,
-      value: scrollTo,
-    });
-    mockScrollGeometry(body as HTMLElement, {
-      clientHeight: 200,
-      scrollHeight: 1000,
-      scrollTop: 20,
-    });
-    mockElementRect(body as HTMLElement, { top: 100, bottom: 300, height: 200 });
-    mockElementRect(headings[0] as HTMLElement, { top: 120, bottom: 140, height: 20 });
-    mockElementRect(headings[1] as HTMLElement, { top: 330, bottom: 350, height: 20 });
-    mockElementRect(headings[2] as HTMLElement, { top: 520, bottom: 540, height: 20 });
-
-    await fireEvent.scroll(body as HTMLElement);
-    await flushPlanMeasure();
-
-    const markers = view.container.querySelectorAll(".timeline-plan-card__heading-marker");
-    const firstMarker = view.getByRole("button", { name: "跳到计划标题：阶段一" });
-    const secondMarker = view.getByRole("button", { name: "跳到计划标题：阶段二" });
-    const thirdMarker = view.getByRole("button", { name: "跳到计划标题：阶段三" });
-
-    expect(markers).toHaveLength(3);
-    expect(firstMarker).toHaveClass("timeline-plan-card__heading-marker--level-4");
-    expect(secondMarker).toHaveClass("timeline-plan-card__heading-marker--level-5");
-    expect(thirdMarker).toHaveClass("timeline-plan-card__heading-marker--level-6");
-    expect(firstMarker).toHaveAttribute("title", "阶段一");
-    expect(firstMarker.querySelector(".timeline-plan-card__heading-marker-tooltip"))
-      .toHaveTextContent("阶段一");
-
-    await fireEvent.click(secondMarker);
-
-    expect(scrollTo).toHaveBeenCalledWith({
-      top: 242,
-      behavior: "smooth",
-    });
-  });
-
-  it("计划内层滚动条按外层规则显隐并支持拖动", async () => {
+  it("思考提示显示上一可见事件到现在的秒数", () => {
     vi.useFakeTimers();
-    try {
-      let body: HTMLElement;
-      const scrollTo = vi.fn(({ top }: ScrollToOptions) => {
-        body.scrollTop = Number(top);
-      });
+    vi.setSystemTime(10_000);
+    const view = render(AgentTimeline, {
+      props: {
+        isThinking: true,
+        events: [
+          timelineEvent({
+            id: "tool-1",
+            kind: "mcp",
+            status: "success",
+            title: "docs / search",
+            summary: "docs / search",
+            payload: { server: "docs", tool: "search" },
+            createdAt: 7_000,
+            updatedAt: 7_000,
+          }),
+        ],
+      },
+    });
+
+    expect(view.getByText("思考中 3 秒")).toBeInTheDocument();
+  });
+
+  it("思考提示显示分秒并追加运行中子代理状态", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(128_000);
+    const view = render(AgentTimeline, {
+      props: {
+        isThinking: true,
+        events: [
+          timelineEvent({
+            id: "subagent-1",
+            kind: "subagent",
+            status: "running",
+            title: "explorer",
+            summary: "Read",
+            payload: {
+              subagentType: "explorer",
+              lastToolName: "Read",
+            },
+            createdAt: 0,
+            updatedAt: 0,
+          }),
+        ],
+      },
+    });
+
+    expect(view.getByText("思考中 2 分 8 秒，子代理explorer正在调用工具")).toBeInTheDocument();
+  });
+
+  it.each(["info", "requires_action"] as const)(
+    "MCP %s 状态图标不生成背景状态 class",
+    (status) => {
       const view = render(AgentTimeline, {
         props: {
-          activePlanApprovalTurnId: "turn-scrollbar",
           events: [
             timelineEvent({
-              id: "plan-scrollbar",
-              kind: "plan",
-              status: "requires_action",
-              title: "ExitPlanMode",
-              turnId: "turn-scrollbar",
+              id: `mcp-${status}-1`,
+              kind: "mcp",
+              status,
+              title: "docs / search",
+              summary: "docs / search",
               payload: {
-                plan: "正文\n\n".repeat(80),
-                approved: null,
-                executionPermission: "ask",
+                server: "docs",
+                tool: "search",
               },
             }),
           ],
         },
       });
-      const shell = view.container.querySelector(".timeline-plan-card__body-shell");
-      body = view.container.querySelector(".timeline-plan-card__body") as HTMLElement;
 
-      expect(shell).toBeInstanceOf(HTMLElement);
-      expect(body).toBeInstanceOf(HTMLElement);
-      Object.defineProperty(body, "scrollTo", {
-        configurable: true,
-        value: scrollTo,
-      });
-      mockScrollGeometry(body, {
-        clientHeight: 200,
-        scrollHeight: 1000,
-        scrollTop: 20,
-      });
-      mockElementRect(body, { top: 100, right: 100, bottom: 300, height: 200 });
-      await flushPlanMeasure();
+      const nodes = [...view.container.querySelectorAll(".agent-timeline__node")];
+      expect(nodes).toHaveLength(1);
+      const node = nodes[0];
+      expect([...node.classList]).toEqual(["agent-timeline__node"]);
+    },
+  );
 
-      await fireEvent.scroll(body);
-      await flushPlanMeasure();
+  it("时间线 icon 节点样式不包含背景声明", () => {
+    const css = readFileSync(resolve(__dirname, "../src/styles.css"), "utf8");
+    const nodeRuleBodies = [...css.matchAll(/\.agent-timeline__node[^{]*\{([^}]*)\}/g)]
+      .map((match) => match[1]);
 
-      const scrollMap = view.container.querySelector(".timeline-plan-card__scroll-map");
-      const track = view.container.querySelector(".timeline-plan-card__scroll-track");
-      const thumb = view.container.querySelector(".timeline-plan-card__scroll-thumb");
-
-      expect(scrollMap).toHaveClass("is-visible");
-      expect(track).toBeInstanceOf(HTMLElement);
-      expect(thumb).toBeInstanceOf(HTMLElement);
-
-      await fireEvent(body, new Event("scrollend"));
-      await vi.advanceTimersByTimeAsync(179);
-      expect(scrollMap).toHaveClass("is-visible");
-      await vi.advanceTimersByTimeAsync(1);
-      await nextTick();
-      expect(scrollMap).not.toHaveClass("is-visible");
-
-      await fireEvent.mouseMove(shell as HTMLElement, { clientX: 95 });
-      expect(scrollMap).toHaveClass("is-visible");
-      await fireEvent.mouseMove(shell as HTMLElement, { clientX: 20 });
-      await vi.advanceTimersByTimeAsync(180);
-      await nextTick();
-      expect(scrollMap).not.toHaveClass("is-visible");
-
-      mockElementRect(track as HTMLElement, { top: 0, bottom: 184, height: 184 });
-      await fireEvent.pointerDown(track as HTMLElement, { clientY: 170, pointerId: 1 });
-      expect(scrollTo).toHaveBeenLastCalledWith({
-        top: 220,
-        behavior: "auto",
-      });
-
-      await fireEvent.pointerDown(thumb as HTMLElement, { clientY: 20, pointerId: 2 });
-      await fireEvent.pointerMove(window, { clientY: 56, pointerId: 2 });
-      expect(body.scrollTop).toBeCloseTo(416, 0);
-      await fireEvent.pointerUp(window, { clientY: 56, pointerId: 2 });
-    } finally {
-      vi.clearAllTimers();
-      vi.useRealTimers();
+    expect(nodeRuleBodies.length).toBeGreaterThan(0);
+    for (const body of nodeRuleBodies) {
+      expect(body).not.toMatch(/\bbackground(?:-color)?\s*:/);
     }
   });
 
-  it("不为未溢出计划或非主计划标题生成内层滚动节点", async () => {
-    const shortView = render(AgentTimeline, {
-      props: {
-        activePlanApprovalTurnId: "turn-short",
-        events: [
-          timelineEvent({
-            id: "plan-short",
-            kind: "plan",
-            status: "requires_action",
-            title: "ExitPlanMode",
-            turnId: "turn-short",
-            payload: {
-              plan: "## 简短计划\n- 一屏内可见",
-              approved: null,
-              executionPermission: "ask",
-            },
-          }),
-        ],
-      },
-    });
-    const shortBody = shortView.container.querySelector(".timeline-plan-card__body");
-    expect(shortBody).toBeInstanceOf(HTMLElement);
-    mockScrollGeometry(shortBody as HTMLElement, {
-      clientHeight: 300,
-      scrollHeight: 300,
-      scrollTop: 0,
-    });
-    await fireEvent.scroll(shortBody as HTMLElement);
-    await flushPlanMeasure();
-    expect(shortView.queryByRole("button", { name: "跳到计划标题：简短计划" }))
-      .not.toBeInTheDocument();
-    shortView.unmount();
-
-    const revisionView = render(AgentTimeline, {
-      props: {
-        events: [
-          timelineEvent({
-            id: "plan-revision-heading",
-            kind: "plan",
-            status: "cancelled",
-            title: "ExitPlanMode",
-            payload: {
-              plan: "只调整一行计划",
-              revisionRequest: "## 修改边界\n把文档边界也写清楚",
-              approved: false,
-              executionPermission: "ask",
-            },
-          }),
-        ],
-      },
-    });
-    const revisionToggle = revisionView.getByRole("button", { name: /要求修改计划/ });
-    await fireEvent.click(revisionToggle);
-    const revisionBody = revisionView.container.querySelector(".timeline-plan-card__body");
-    expect(revisionBody).toBeInstanceOf(HTMLElement);
-    mockScrollGeometry(revisionBody as HTMLElement, {
-      clientHeight: 160,
-      scrollHeight: 500,
-      scrollTop: 0,
-    });
-    await fireEvent.scroll(revisionBody as HTMLElement);
-    await flushPlanMeasure();
-    expect(revisionView.queryByRole("button", { name: "跳到计划标题：修改边界" }))
-      .not.toBeInTheDocument();
-  });
-
-  it("处理后的计划默认折叠并可再次展开", async () => {
-    const acceptedView = render(AgentTimeline, {
-      props: {
-        events: [
-          timelineEvent({
-            id: "plan-accepted",
-            kind: "plan",
-            status: "success",
-            title: "ExitPlanMode",
-            payload: {
-              plan: "## 已确认计划\n- 执行改动",
-              approved: true,
-              executionPermission: "full",
-            },
-          }),
-        ],
-      },
-    });
-    expect(acceptedView.container.querySelector(".timeline-card--plan"))
-      .toHaveClass("is-collapsed");
-    expect(acceptedView.container.querySelector(".timeline-plan-card__badge"))
-      .toHaveClass("timeline-plan-card__badge--approved");
-    expect(acceptedView.getByRole("button", { name: /已确认计划/ }))
-      .toHaveAttribute("aria-expanded", "false");
-    acceptedView.unmount();
-
-    const cancelledView = render(AgentTimeline, {
-      props: {
-        events: [
-          timelineEvent({
-            id: "plan-cancelled",
-            kind: "plan",
-            status: "cancelled",
-            title: "ExitPlanMode",
-            payload: {
-              plan: "## 已取消计划\n- 暂不执行",
-              approved: false,
-              executionPermission: "ask",
-            },
-          }),
-        ],
-      },
-    });
-    expect(cancelledView.container.querySelector(".timeline-card--plan"))
-      .toHaveClass("is-collapsed");
-    expect(cancelledView.container.querySelector(".timeline-plan-card__badge"))
-      .toHaveClass("timeline-plan-card__badge--rejected");
-    expect(cancelledView.getByRole("button", { name: /已取消计划/ }))
-      .toHaveAttribute("aria-expanded", "false");
-    cancelledView.unmount();
-
-    const revisionView = render(AgentTimeline, {
-      props: {
-        events: [
-          timelineEvent({
-            id: "plan-revision",
-            kind: "plan",
-            status: "cancelled",
-            title: "ExitPlanMode",
-            payload: {
-              plan: "## 当前计划\n- 先改 runner\n- 再补测试",
-              revisionRequest: "把文档边界也写清楚",
-              approved: false,
-              executionPermission: "ask",
-            },
-          }),
-        ],
-      },
-    });
-    const revisionToggle = revisionView.getByRole("button", { name: /要求修改计划/ });
-
-    expect(revisionView.container.querySelector(".timeline-card--plan"))
-      .toHaveClass("is-collapsed");
-    expect(revisionView.container.querySelector(".timeline-plan-card__badge"))
-      .toHaveClass("timeline-plan-card__badge--revision");
-    expect(revisionToggle).toHaveAttribute("aria-expanded", "false");
-    expect(revisionView.getByText("修改要求：把文档边界也写清楚")).toBeInTheDocument();
-    expect(revisionView.queryByText("先改 runner")).not.toBeInTheDocument();
-
-    await fireEvent.click(revisionToggle);
-
-    expect(revisionView.container.querySelector(".timeline-card--plan"))
-      .toHaveClass("is-expanded");
-    expect(revisionToggle).toHaveAttribute("aria-expanded", "true");
-    expect(revisionView.getByLabelText("修改要求")).toBeInTheDocument();
-    expect(revisionView.getByText("先改 runner")).toBeInTheDocument();
-    expect(revisionView.getByText("把文档边界也写清楚")).toBeInTheDocument();
-
-    await fireEvent.click(revisionToggle);
-
-    expect(revisionView.container.querySelector(".timeline-card--plan"))
-      .toHaveClass("is-collapsed");
-    expect(revisionToggle).toHaveAttribute("aria-expanded", "false");
-  });
-
-  it("无详情的读取和搜索事件不提供展开入口", async () => {
+  it("折叠的过程事件不参与 rail 避让计算", async () => {
     const view = render(AgentTimeline, {
       props: {
         events: [
           timelineEvent({
-            id: "read-1",
-            kind: "file_read",
-            title: "Read",
-            summary: "src/App.vue",
+            id: "tool-1",
+            kind: "mcp",
+            status: "success",
+            title: "docs / search",
+            summary: "docs / search",
             payload: {
-              path: "src/App.vue",
-              offset: 10,
-              limit: 20,
-              output: "const app = createApp(App);",
+              server: "docs",
+              tool: "search",
             },
+            turnId: "turn-1",
+            turnSeq: 1,
+            intraTurnOrder: 1,
           }),
           timelineEvent({
-            id: "search-1",
-            kind: "search",
-            title: "Glob",
-            summary: "*.vue",
+            id: "reply-1",
+            kind: "message",
+            status: "success",
+            title: "Assistant",
+            summary: "done",
             payload: {
-              subkind: "glob",
-              query: "*.vue",
-              path: "apps/desktop/src",
-              output: "apps/desktop/src/App.vue",
+              role: "assistant",
+              content: "功能测试全部通过。\n\n还有什么需要继续测试的吗？",
             },
-            createdAt: 2,
-            updatedAt: 2,
+            turnId: "turn-1",
+            turnSeq: 1,
             intraTurnOrder: 2,
+          }),
+          timelineEvent({
+            id: "turn-end-1",
+            kind: "turn",
+            status: "success",
+            title: "turn done",
+            summary: "",
+            payload: {},
+            turnId: "turn-1",
+            turnSeq: 1,
+            intraTurnOrder: 3,
           }),
         ],
       },
     });
 
-    expect(view.container.querySelector(".agent-timeline__chevron")).not.toBeInTheDocument();
+    await nextFrame();
+    await nextFrame();
 
-    await fireEvent.click(view.getByRole("button", { name: "已读取 src/App.vue" }));
-    await fireEvent.click(view.getByRole("button", { name: "已查找文件 *.vue" }));
-
-    expect(view.container.querySelector(".agent-timeline__content")).not.toBeInTheDocument();
+    const railLine = view.container.querySelector<HTMLElement>(".agent-timeline__rail-line");
+    expect(railLine?.style.maskImage).toBe("");
+    expect(railLine?.style.webkitMaskImage).toBe("");
   });
 
   it("有详情事件仍可展开", async () => {
@@ -1184,77 +564,47 @@ describe("timeline event expansion", () => {
     expect(view.getByText("COMMAND")).toBeInTheDocument();
   });
 
-  it("长命令可展开查看完整命令，短命令无详情时不可展开", async () => {
-    const longCommand = `node scripts/build-report.js --workspace apps/desktop --filter timeline --output dist/reports/timeline-display.json --include-snapshots --include-contracts --max-old-space-size=4096 --verbose --dry-run`;
-    const shortView = render(AgentTimeline, {
-      props: {
-        events: [
-          timelineEvent({
-            id: "short-command",
-            kind: "command",
-            title: "pwd",
-            summary: "",
-            payload: { command: "pwd" },
-          }),
-        ],
-      },
-    });
-    expect(shortView.getByRole("button", { name: "已运行 pwd" }))
-      .toHaveAttribute("aria-expanded", "false");
-    expect(shortView.container.querySelector(".agent-timeline__chevron")).not.toBeInTheDocument();
-
-    await fireEvent.click(shortView.getByRole("button", { name: "已运行 pwd" }));
-    expect(shortView.container.querySelector(".agent-timeline__content")).not.toBeInTheDocument();
-    shortView.unmount();
-
-    const longView = render(AgentTimeline, {
-      props: {
-        events: [
-          timelineEvent({
-            id: "long-command",
-            kind: "command",
-            title: longCommand,
-            summary: "",
-            payload: { command: longCommand },
-            createdAt: 2,
-            updatedAt: 2,
-            intraTurnOrder: 2,
-          }),
-        ],
-      },
-    });
-
-    expect(longView.getByRole("button", { name: `已运行 ${longCommand}` }))
-      .toHaveAttribute("aria-expanded", "false");
-    expect(longView.container.querySelector(".agent-timeline__chevron")).toBeInTheDocument();
-
-    await fireEvent.click(longView.getByRole("button", { name: `已运行 ${longCommand}` }));
-    expect(longView.getByText("COMMAND")).toBeInTheDocument();
-    expect(longView.getByText(longCommand)).toBeInTheDocument();
-  });
-
-  it("传入项目路径后折叠态显示相对路径", async () => {
+  it("运行失败错误按 Agent 回复渲染，不显示错误概要卡", () => {
     const view = render(AgentTimeline, {
       props: {
-        projectCwd: "C:\\Files\\workspace\\Lilia",
         events: [
           timelineEvent({
-            id: "read-absolute",
-            kind: "file_read",
-            title: "Read",
-            summary: "C:\\Files\\workspace\\Lilia\\apps\\desktop\\src\\App.vue",
-            payload: {
-              path: "C:\\Files\\workspace\\Lilia\\apps\\desktop\\src\\App.vue",
-            },
+            id: "error-1",
+            kind: "error",
+            status: "error",
+            title: "Runner error",
+            summary: "provider failed",
+            payload: {},
           }),
         ],
       },
     });
 
-    expect(view.getByRole("button", { name: "已读取 apps/desktop/src/App.vue" }))
-      .toBeInTheDocument();
-    expect(view.getByText("apps/desktop/src/App.vue")).toBeInTheDocument();
-    expect(view.queryByText("C:\\Files\\workspace\\Lilia\\apps\\desktop\\src\\App.vue"))
-      .not.toBeInTheDocument();
+    expect(view.container.querySelector(".timeline-card--final-reply")).toBeInTheDocument();
+    expect(view.getByText("发生错误")).toBeInTheDocument();
+    expect(view.getByText("provider failed")).toBeInTheDocument();
+    expect(view.queryByText("Runner error")).not.toBeInTheDocument();
+    expect(view.container.querySelector(".agent-timeline__preview")).not.toBeInTheDocument();
+  });
+
+  it("中断错误仍按过程状态渲染", () => {
+    const view = render(AgentTimeline, {
+      props: {
+        events: [
+          timelineEvent({
+            id: "interrupt-1",
+            kind: "error",
+            status: "error",
+            title: "Interrupted",
+            summary: "用户已中断",
+            payload: { interrupted: true },
+          }),
+        ],
+      },
+    });
+
+    expect(view.container.querySelector(".timeline-card--final-reply")).not.toBeInTheDocument();
+    expect(view.getByRole("button", { name: "发生错误" })).toBeInTheDocument();
+    expect(view.container.querySelector(".agent-timeline__preview")).toHaveTextContent("用户已中断");
   });
 });

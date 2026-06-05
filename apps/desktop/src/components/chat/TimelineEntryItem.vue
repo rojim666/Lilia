@@ -1,19 +1,23 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { ChevronDown, ChevronRight } from "lucide-vue-next";
+import { ChevronDown, ChevronRight, RotateCcw } from "lucide-vue-next";
 import type { AgentTimelineEvent, AgentTimelineEventStatus } from "@lilia/contracts";
-import {
-  pendingActionForTimelineEvent,
-  timelineEventRequiresAgentAction,
-  type PendingAgentAction,
-  type PendingAgentActionResolution,
+import type {
+  PendingAgentAction,
+  PendingAgentActionResolution,
 } from "../../composables/usePendingAgentActions";
 import TimelineDeclaredEvent from "./TimelineDeclaredEvent.vue";
 import TimelineFinalReply from "./TimelineFinalReply.vue";
 import TimelineNodeIcon from "./TimelineNodeIcon.vue";
 import TimelinePlanCard from "./TimelinePlanCard.vue";
+import type { ChatImageViewerSource } from "./imageViewer";
 import type { TimelineEntry, TimelineEventEntry, TimelineGroupEntry } from "./timelineEntries";
 import {
+  hasTimelinePendingActionState,
+  timelinePendingActionState,
+} from "./timelinePendingActions";
+import {
+  isTimelineErrorReply,
   isTimelineFinalReply,
   isTimelineFinalReplyStreaming,
   readTimelineDisplay,
@@ -36,6 +40,7 @@ const props = defineProps<{
   projectCwd?: string | null;
   pendingActions?: PendingAgentAction[];
   showExpiredPendingActions?: boolean;
+  canRetryEvent?: (event: AgentTimelineEvent) => boolean;
 }>();
 
 const emit = defineEmits<{
@@ -43,6 +48,8 @@ const emit = defineEmits<{
   toggleGroup: [entry: TimelineGroupEntry];
   toggleProcessGroup: [event: AgentTimelineEvent];
   resolvePendingAction: [resolution: PendingAgentActionResolution];
+  "retry-event": [event: AgentTimelineEvent];
+  "open-image": [image: ChatImageViewerSource];
 }>();
 
 const displayContext = computed<TimelineDisplayContext>(() => ({ projectCwd: props.projectCwd }));
@@ -54,8 +61,11 @@ function isTimelineMessage(event: AgentTimelineEvent): boolean {
 
 function canToggle(event: AgentTimelineEvent): boolean {
   return timelineCanExpand(event, displayContext.value) ||
-    !!pendingAction(event) ||
-    expiredPendingAction(event);
+    hasTimelinePendingActionState(pendingState(event));
+}
+
+function canRetry(event: AgentTimelineEvent): boolean {
+  return props.canRetryEvent?.(event) === true;
 }
 
 function isCompact(event: AgentTimelineEvent): boolean {
@@ -64,6 +74,13 @@ function isCompact(event: AgentTimelineEvent): boolean {
 
 function hasProcessEvents(entry: TimelineEventEntry): boolean {
   return Boolean(entry.processEvents?.length);
+}
+
+function shouldShowHeader(entry: TimelineEventEntry): boolean {
+  return !isTimelineFinalReply(entry.event) ||
+    isTimelineErrorReply(entry.event) ||
+    hasProcessEvents(entry) ||
+    canRetry(entry.event);
 }
 
 function shouldShowNodeIcon(entry: TimelineEventEntry): boolean {
@@ -103,13 +120,19 @@ function kindClass(prefix: string, kind: string): string {
 }
 
 function pendingAction(event: AgentTimelineEvent): PendingAgentAction | null {
-  return pendingActionForTimelineEvent(event, pendingActions.value);
+  return pendingState(event).action;
 }
 
 function expiredPendingAction(event: AgentTimelineEvent): boolean {
-  if (props.showExpiredPendingActions !== true) return false;
-  if (pendingAction(event)) return false;
-  return timelineEventRequiresAgentAction(event);
+  return pendingState(event).expired;
+}
+
+function pendingState(event: AgentTimelineEvent) {
+  return timelinePendingActionState(
+    event,
+    pendingActions.value,
+    props.showExpiredPendingActions,
+  );
 }
 
 function groupScrollAnchorIds(entry: TimelineGroupEntry): string {
@@ -137,7 +160,6 @@ function groupScrollAnchorIds(entry: TimelineGroupEntry): string {
     >
       <div class="agent-timeline__rail">
         <TimelineNodeIcon
-          :status="entry.aggregatedStatus"
           :icon="nodeIcon(entry.representative)"
         />
       </div>
@@ -214,6 +236,17 @@ function groupScrollAnchorIds(entry: TimelineGroupEntry): string {
                 >
                   {{ previewText(event) }}
                 </p>
+
+                <button
+                  v-if="canRetry(event)"
+                  type="button"
+                  class="agent-timeline__retry"
+                  title="重新发送上下文"
+                  aria-label="重试"
+                  @click.stop="emit('retry-event', event)"
+                >
+                  <RotateCcw :size="12" aria-hidden="true" />
+                </button>
               </header>
 
               <div
@@ -260,7 +293,6 @@ function groupScrollAnchorIds(entry: TimelineGroupEntry): string {
       <div class="agent-timeline__rail">
         <TimelineNodeIcon
           v-if="shouldShowNodeIcon(entry)"
-          :status="entry.event.status"
           :icon="nodeIcon(entry.event)"
         />
       </div>
@@ -279,9 +311,15 @@ function groupScrollAnchorIds(entry: TimelineGroupEntry): string {
 
         <template v-else>
           <header
-            v-if="!isTimelineFinalReply(entry.event) || hasProcessEvents(entry)"
+            v-if="shouldShowHeader(entry)"
             class="agent-timeline__head"
           >
+            <span
+              v-if="isTimelineErrorReply(entry.event)"
+              class="agent-timeline__title"
+            >
+              <span>{{ labelText(entry.event) }}</span>
+            </span>
             <button
               v-if="!isTimelineFinalReply(entry.event)"
               type="button"
@@ -310,6 +348,17 @@ function groupScrollAnchorIds(entry: TimelineGroupEntry): string {
             >
               {{ previewText(entry.event) }}
             </p>
+
+            <button
+              v-if="canRetry(entry.event)"
+              type="button"
+              class="agent-timeline__retry"
+              title="重新发送上下文"
+              aria-label="重试"
+              @click.stop="emit('retry-event', entry.event)"
+            >
+              <RotateCcw :size="12" aria-hidden="true" />
+            </button>
 
             <button
               v-if="hasProcessEvents(entry)"
@@ -347,10 +396,13 @@ function groupScrollAnchorIds(entry: TimelineGroupEntry): string {
                 :project-cwd="projectCwd"
                 :pending-actions="pendingActions"
                 :show-expired-pending-actions="showExpiredPendingActions"
+                :can-retry-event="canRetryEvent"
                 @toggle-event="emit('toggleEvent', $event)"
                 @toggle-group="emit('toggleGroup', $event)"
                 @toggle-process-group="emit('toggleProcessGroup', $event)"
                 @resolve-pending-action="emit('resolvePendingAction', $event)"
+                @retry-event="emit('retry-event', $event)"
+                @open-image="emit('open-image', $event)"
               />
             </ol>
           </div>
@@ -364,6 +416,7 @@ function groupScrollAnchorIds(entry: TimelineGroupEntry): string {
               v-if="isTimelineFinalReply(entry.event)"
               :event="entry.event"
               :streaming="isTimelineFinalReplyStreaming(entry.event)"
+              @open-image="emit('open-image', $event)"
             />
             <TimelineDeclaredEvent
               v-else

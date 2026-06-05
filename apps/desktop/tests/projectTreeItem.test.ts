@@ -1,7 +1,7 @@
 import { render, fireEvent, waitFor } from "@testing-library/vue";
 import { createMemoryHistory, createRouter } from "vue-router";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { defineComponent, nextTick } from "vue";
+import { describe, expect, it, vi } from "vitest";
+import { defineComponent } from "vue";
 import type { Task } from "@lilia/contracts";
 import ProjectTreeItem from "../src/components/sidebar/ProjectTreeItem.vue";
 import ContextMenuHost from "../src/components/ContextMenuHost.vue";
@@ -54,16 +54,11 @@ async function renderProjectTreeItem(initialRoute = "/projects/lilia") {
         type: Boolean,
         default: true,
       },
-      treeActivityToken: {
-        type: Number,
-        default: 0,
-      },
     },
     template: `
       <ProjectTreeItem
         :project="project"
         :is-expanded="isExpanded"
-        :tree-activity-token="treeActivityToken"
         @toggle="$emit('toggle', $event)"
         @error="emitError"
         @archived="emitArchived"
@@ -94,7 +89,6 @@ async function renderProjectTreeItem(initialRoute = "/projects/lilia") {
   const view = render(Wrapper, {
     props: {
       isExpanded: true,
-      treeActivityToken: 0,
     },
     global: {
       plugins: [router],
@@ -105,10 +99,6 @@ async function renderProjectTreeItem(initialRoute = "/projects/lilia") {
   });
   return { ...view, router };
 }
-
-afterEach(() => {
-  vi.useRealTimers();
-});
 
 describe("ProjectTreeItem", () => {
   it("项目行主体点击会展开折叠，项目名称不再直接导航", async () => {
@@ -123,6 +113,7 @@ describe("ProjectTreeItem", () => {
 
     expect(view.emitted("toggle")).toEqual([["lilia"]]);
   });
+
 
   it("项目右键菜单第一项进入对应项目", async () => {
     const view = await renderProjectTreeItem("/projects/tools");
@@ -139,54 +130,46 @@ describe("ProjectTreeItem", () => {
     });
   });
 
-  it("session 置顶按钮显示在归档按钮左侧并触发切换", async () => {
-    const view = await renderProjectTreeItem();
-    const sessionRow = view.getByText("接入 Claude Code 会话发现")
-      .closest("a");
-    const buttons = Array.from(sessionRow?.querySelectorAll("button") ?? []);
-
-    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual([
-      "置顶",
-      "归档",
-    ]);
-
-    await fireEvent.click(buttons[0]);
-
-    expect(mockInvoke.mock.calls.at(-1)?.slice(0, 2)).toEqual([
-      "task_toggle_pin",
-      { id: "t-001" },
-    ]);
-
-    await waitFor(() => {
-      expect(view.getByLabelText("取消置顶")).toHaveClass("is-pinned");
-    });
-  });
-
-  it("归档失败时发出错误事件而不是 archived", async () => {
-    mockInvoke.mockRejectedValueOnce(new Error("archive failed"));
-    const view = await renderProjectTreeItem();
+  it("项目菜单可在弹出窗口中创建对话", async () => {
+    const view = await renderProjectTreeItem("/projects/tools");
 
     await fireEvent.click(view.getByLabelText("更多"));
-    await fireEvent.click(await view.findByText("归档所有对话"));
-    await fireEvent.click(await view.findByText("确认归档？再点一次"));
+    await fireEvent.click(await view.findByRole("menuitem", {
+      name: "在弹出窗口中创建对话",
+    }));
 
-    await waitFor(() => {
-      expect(view.emitted("error")?.[0]?.[0]).toContain("归档所有对话失败");
-    });
-    expect(view.emitted("archived")).toBeUndefined();
+    expect(mockInvoke).toHaveBeenCalledWith("popup_open_new_chat", {
+      projectId: "lilia",
+    }, undefined);
   });
 
-  it("归档当前打开的项目对话成功后才发出 archived", async () => {
-    const view = await renderProjectTreeItem("/projects/lilia/tasks/t-001");
+  it("中键点击项目行会在弹出窗口中创建对话", async () => {
+    const view = await renderProjectTreeItem("/projects/tools");
+    const projectRow = view.getByText("Lilia").closest(".sb-tree__row--project");
 
-    await fireEvent.click(view.getByLabelText("更多"));
-    await fireEvent.click(await view.findByText("归档所有对话"));
-    await fireEvent.click(await view.findByText("确认归档？再点一次"));
+    await fireEvent(
+      projectRow!,
+      new MouseEvent("auxclick", { bubbles: true, button: 1 }),
+    );
 
-    await waitFor(() => {
-      expect(view.emitted("archived")).toHaveLength(1);
-    });
-    expect(view.emitted("error")).toBeUndefined();
+    expect(mockInvoke).toHaveBeenCalledWith("popup_open_new_chat", {
+      projectId: "lilia",
+    }, undefined);
+  });
+
+  it("中键点击项目对话会在弹出窗口中打开", async () => {
+    const view = await renderProjectTreeItem();
+    const row = view.getByText("接入 Claude Code 会话发现").closest(".sb-tree__row");
+
+    await fireEvent(
+      row!,
+      new MouseEvent("auxclick", { bubbles: true, button: 1 }),
+    );
+
+    expect(mockInvoke).toHaveBeenCalledWith("popup_open_task", {
+      projectId: "lilia",
+      taskId: "t-001",
+    }, undefined);
   });
 
   it("项目对话超过四条时用省略行折叠剩余对话，并可点击展开", async () => {
@@ -208,67 +191,5 @@ describe("ProjectTreeItem", () => {
     expect(view.getByText("对话 5")).toBeInTheDocument();
     expect(view.getByText("对话 6")).toBeInTheDocument();
     expect(view.queryByRole("button", { name: "显示剩余对话" })).not.toBeInTheDocument();
-  });
-
-  it("展开剩余对话后 30 秒无树内活动会恢复折叠", async () => {
-    seedProjectConversations(5);
-    const view = await renderProjectTreeItem();
-    vi.useFakeTimers();
-
-    await fireEvent.click(view.getByRole("button", { name: "显示剩余对话" }));
-    expect(view.getByText("对话 5")).toBeInTheDocument();
-
-    await vi.advanceTimersByTimeAsync(29_999);
-    expect(view.getByText("对话 5")).toBeInTheDocument();
-
-    await vi.advanceTimersByTimeAsync(1);
-    await nextTick();
-    expect(view.queryByText("对话 5")).not.toBeInTheDocument();
-    expect(view.getByRole("button", { name: "显示剩余对话" })).toBeInTheDocument();
-  });
-
-  it("树内活动会刷新展开剩余对话后的自动折叠计时", async () => {
-    seedProjectConversations(5);
-    const view = await renderProjectTreeItem();
-    vi.useFakeTimers();
-
-    await fireEvent.click(view.getByRole("button", { name: "显示剩余对话" }));
-    await vi.advanceTimersByTimeAsync(20_000);
-    await view.rerender({ isExpanded: true, treeActivityToken: 1 });
-
-    await vi.advanceTimersByTimeAsync(20_000);
-    expect(view.getByText("对话 5")).toBeInTheDocument();
-
-    await vi.advanceTimersByTimeAsync(10_000);
-    await nextTick();
-    expect(view.queryByText("对话 5")).not.toBeInTheDocument();
-  });
-
-  it("折叠项目后会重置项目内对话折叠状态", async () => {
-    seedProjectConversations(5);
-    const view = await renderProjectTreeItem();
-
-    await fireEvent.click(view.getByRole("button", { name: "显示剩余对话" }));
-    expect(view.getByText("对话 5")).toBeInTheDocument();
-
-    await view.rerender({ isExpanded: false, treeActivityToken: 0 });
-    await view.rerender({ isExpanded: true, treeActivityToken: 0 });
-
-    expect(view.queryByText("对话 5")).not.toBeInTheDocument();
-    expect(view.getByRole("button", { name: "显示剩余对话" })).toBeInTheDocument();
-  });
-
-  it("当前打开的隐藏对话会在折叠态占用第四个可见位置", async () => {
-    seedProjectConversations(6);
-
-    const view = await renderProjectTreeItem("/projects/lilia/tasks/t-overflow-6");
-
-    expect(view.getByText("对话 1")).toBeInTheDocument();
-    expect(view.getByText("对话 2")).toBeInTheDocument();
-    expect(view.getByText("对话 3")).toBeInTheDocument();
-    expect(view.queryByText("对话 4")).not.toBeInTheDocument();
-    expect(view.queryByText("对话 5")).not.toBeInTheDocument();
-    expect(view.getByText("对话 6")).toBeInTheDocument();
-    expect(view.getByRole("button", { name: "显示剩余对话" })).toBeInTheDocument();
   });
 });

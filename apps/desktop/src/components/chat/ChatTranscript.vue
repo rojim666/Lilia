@@ -7,6 +7,7 @@ import type {
 } from "../../composables/usePendingAgentActions";
 import AgentTimeline from "./AgentTimeline.vue";
 import ChatScrollMap from "./ChatScrollMap.vue";
+import type { ChatImageViewerSource } from "./imageViewer";
 
 const props = defineProps<{
   timelineEvents: AgentTimelineEvent[];
@@ -17,10 +18,13 @@ const props = defineProps<{
   forceScrollBottomKey?: number;
   pendingAgentActions?: PendingAgentAction[];
   showExpiredPendingActions?: boolean;
+  canRetryEvent?: (event: AgentTimelineEvent) => boolean;
 }>();
 
 const emit = defineEmits<{
   resolvePendingAgentAction: [resolution: PendingAgentActionResolution];
+  "retry-event": [event: AgentTimelineEvent];
+  "open-image": [image: ChatImageViewerSource];
 }>();
 
 const scroller = ref<HTMLElement | null>(null);
@@ -160,8 +164,11 @@ const isEmpty = computed(() =>
           :active-plan-approval-turn-id="activePlanApprovalTurnId"
           :pending-actions="pendingAgentActions"
           :show-expired-pending-actions="showExpiredPendingActions"
+          :can-retry-event="canRetryEvent"
           @event-toggled="onTimelineEventToggled"
           @resolve-pending-action="emit('resolvePendingAgentAction', $event)"
+          @retry-event="emit('retry-event', $event)"
+          @open-image="emit('open-image', $event)"
         />
       </template>
       <div class="chat-controls-wrap">

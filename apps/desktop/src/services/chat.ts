@@ -8,6 +8,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentInteractionSettings,
+  AgentInteractionKind,
+  AgentInteractionRequest,
+  AgentInteractionResponse,
   AssistantAIConfig,
   AssistantAITestResult,
   BackendEnvStatus,
@@ -15,23 +18,30 @@ import type {
   CCSwitchStatus,
   ChatBackendKind,
   ChatAttachment,
+  ChatContextSearchResult,
   ChatComposerState,
   AgentTimelineEvent,
-  AgentAskUserRequestEvent,
-  AskUserResult,
-  ChatModelOption,
   ChatSendResult,
   ConnectionMode,
   EnvStatusReport,
   ProviderConfig,
   RouterMode,
+  SuggestionItem,
+  SuggestionSettings,
+  ToolConsentDecision,
+  ToolConsentRequest,
+  ToolConsentUpdatedInput,
 } from "@lilia/contracts";
 
 export type {
   AgentInteractionSettings,
+  AgentInteractionKind,
+  AgentInteractionRequest,
+  AgentInteractionResponse,
   AssistantAIConfig,
   AssistantAITestResult,
   ChatAttachment,
+  ChatContextSearchResult,
   ConnectionMode,
   BackendEnvStatus,
   CCSwitchConfig,
@@ -39,34 +49,15 @@ export type {
   EnvStatusReport,
   ProviderConfig,
   RouterMode,
+  SuggestionItem,
+  SuggestionSettings,
+  ToolConsentDecision,
+  ToolConsentRequest,
+  ToolConsentUpdatedInput,
 };
 
 export interface TurnStartedEvent { taskId: string; queuedCount: number; }
 export interface DoneEvent { taskId: string; sessionId: string | null; subtype: string | null; }
-
-/**
- * runner 通过 canUseTool 把工具调用授权请求转过来，等用户决策。
- * 字段对齐 Claude SDK 的 CanUseTool 入参：title / description / displayName
- * 由 SDK bridge 在能拿到时填好；input 是原始工具入参 JSON。
- */
-export interface ToolConsentRequest {
-  taskId: string;
-  turnId: string;
-  backend: ChatBackendKind;
-  requestId: string;
-  toolName: string;
-  input: Record<string, unknown>;
-  title: string | null;
-  displayName: string | null;
-  description: string | null;
-  blockedPath: string | null;
-  decisionReason: string | null;
-  toolUseId: string | null;
-}
-
-export type ToolConsentDecision = "allow" | "deny";
-
-export type AgentAskUserRequest = AgentAskUserRequestEvent;
 
 export function listAgentTimeline(taskId: string): Promise<AgentTimelineEvent[]> {
   return invoke<AgentTimelineEvent[]>("agent_timeline_list", { taskId });
@@ -83,6 +74,7 @@ export function sendMessage(
   composer: ChatComposerState,
   projectCwd: string,
   attachments: ChatAttachment[] = [],
+  guideId?: string,
 ): Promise<ChatSendResult> {
   return invoke<ChatSendResult>("chat_send_message", {
     taskId,
@@ -90,6 +82,7 @@ export function sendMessage(
     composer,
     projectCwd,
     attachments,
+    guideId: guideId ?? null,
   });
 }
 
@@ -99,6 +92,34 @@ export function interruptTurn(taskId: string): Promise<void> {
 
 export function describeAttachments(paths: string[]): Promise<ChatAttachment[]> {
   return invoke<ChatAttachment[]>("chat_describe_attachments", { paths });
+}
+
+export function searchContextAttachments(
+  projectCwd: string,
+  query: string,
+  limit = 12,
+): Promise<ChatContextSearchResult[]> {
+  return invoke<ChatContextSearchResult[]>("chat_search_context_attachments", {
+    projectCwd,
+    query,
+    limit,
+  });
+}
+
+export function readClipboardFilePaths(): Promise<string[]> {
+  return invoke<string[]>("chat_read_clipboard_file_paths");
+}
+
+export function saveClipboardImage(input: {
+  mime: string | null;
+  bytesBase64: string;
+  name?: string | null;
+}): Promise<ChatAttachment> {
+  return invoke<ChatAttachment>("chat_save_clipboard_image", { input });
+}
+
+export function saveClipboardText(input: { text: string }): Promise<ChatAttachment> {
+  return invoke<ChatAttachment>("chat_save_clipboard_text", { input });
 }
 
 export async function pickAttachmentFiles(): Promise<string[]> {
@@ -111,10 +132,6 @@ export async function pickAttachmentFiles(): Promise<string[]> {
   });
   if (!picked) return [];
   return Array.isArray(picked) ? picked : [picked];
-}
-
-export function listModels(backend: ChatBackendKind): Promise<ChatModelOption[]> {
-  return invoke<ChatModelOption[]>("chat_list_models", { backend });
 }
 
 export function getComposerState(taskId: string): Promise<ChatComposerState> {
@@ -141,8 +158,10 @@ export function resetSession(taskId: string): Promise<void> {
 }
 
 /** 健康检查：node / codex CLI 是否在 PATH，两个 backend 当前的连接模式。 */
-export function checkEnv(): Promise<EnvStatusReport> {
-  return invoke<EnvStatusReport>("chat_check_env");
+export function checkEnv(options: { forceRefresh?: boolean } = {}): Promise<EnvStatusReport> {
+  return invoke<EnvStatusReport>("chat_check_env", {
+    forceRefresh: options.forceRefresh ?? false,
+  });
 }
 
 export function getProviderConfig(backend: ChatBackendKind): Promise<ProviderConfig> {
@@ -151,6 +170,14 @@ export function getProviderConfig(backend: ChatBackendKind): Promise<ProviderCon
 
 export function setProviderConfig(config: ProviderConfig): Promise<void> {
   return invoke<void>("provider_set_config", { config });
+}
+
+export function getActiveBackend(): Promise<ChatBackendKind> {
+  return invoke<ChatBackendKind>("provider_get_active_backend");
+}
+
+export function setActiveBackend(backend: ChatBackendKind): Promise<void> {
+  return invoke<void>("provider_set_active_backend", { backend });
 }
 
 export function getCCSwitchConfig(): Promise<CCSwitchConfig> {
@@ -186,6 +213,26 @@ export function testAssistantAIConnection(
   return invoke<AssistantAITestResult>("assistant_ai_test_connection", { config });
 }
 
+export function getConversationSuggestions(
+  projectId?: string | null,
+  forceRefresh = false,
+): Promise<SuggestionItem[]> {
+  return invoke<SuggestionItem[]>("conversation_suggestions_get", {
+    projectId: projectId ?? null,
+    forceRefresh,
+  });
+}
+
+export function getConversationSuggestionSettings(): Promise<SuggestionSettings> {
+  return invoke<SuggestionSettings>("conversation_suggestions_get_settings");
+}
+
+export function setConversationSuggestionSettings(
+  settings: SuggestionSettings,
+): Promise<void> {
+  return invoke<void>("conversation_suggestions_set_settings", { settings });
+}
+
 // ---- 事件订阅 ----
 // UI 只订阅 turn 状态和 agent timeline；文本、工具、错误都归入 timeline 事件。
 
@@ -203,46 +250,46 @@ export function onAgentTimeline(
   return listen<AgentTimelineEvent>("agent:timeline", (event) => handler(event.payload));
 }
 
-export function onToolConsentRequest(
-  handler: (e: ToolConsentRequest) => void,
-): Promise<UnlistenFn> {
-  return listen<ToolConsentRequest>("chat:tool-consent-request", (event) =>
-    handler(event.payload),
-  );
-}
-
-export function onAskUserRequest(
-  handler: (e: AgentAskUserRequest) => void,
-): Promise<UnlistenFn> {
-  return listen<AgentAskUserRequest>("chat:ask-user-request", (event) =>
-    handler(event.payload),
-  );
-}
-
-/** 把用户对一次 canUseTool 的决策写回 runner，让被卡住的工具继续 / 终止。 */
-export function respondToolConsent(
-  taskId: string,
-  requestId: string,
-  decision: ToolConsentDecision,
-  message?: string,
-): Promise<void> {
-  return invoke<void>("chat_respond_tool_consent", {
+function normalizeAgentInteractionRequest(value: AgentInteractionRequest): AgentInteractionRequest | null {
+  const row = value as unknown as Record<string, unknown>;
+  const payload = row.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const taskId = stringField(row, "taskId");
+  const turnId = stringField(row, "turnId");
+  const requestId = stringField(row, "requestId");
+  const backend = stringField(row, "backend");
+  const kind = stringField(row, "kind");
+  if (!taskId || !requestId) return null;
+  if (kind !== "plan_approval" && kind !== "tool_consent" && kind !== "ask_user") return null;
+  return {
     taskId,
+    turnId,
+    backend: backend === "codex" ? "codex" : "claude",
     requestId,
-    decision,
-    message: message ?? null,
+    kind,
+    payload,
+  } as AgentInteractionRequest;
+}
+
+export function onAgentInteractionRequest(
+  handler: (e: AgentInteractionRequest) => void,
+): Promise<UnlistenFn> {
+  return listen<AgentInteractionRequest>("chat:agent-interaction-request", (event) => {
+    const req = normalizeAgentInteractionRequest(event.payload);
+    if (req) handler(req);
   });
 }
 
-/** 把 AskUser 浮层收集到的结果写回 runner，让 Claude AskUserQuestion 继续。 */
-export function respondAskUser(
-  taskId: string,
-  requestId: string,
-  result: AskUserResult,
-): Promise<void> {
-  return invoke<void>("chat_respond_ask_user", {
-    taskId,
-    requestId,
-    result,
+function stringField(row: Record<string, unknown>, key: string): string {
+  const value = row[key];
+  return typeof value === "string" ? value : "";
+}
+
+export function respondAgentInteraction(response: AgentInteractionResponse): Promise<void> {
+  return invoke<void>("chat_respond_agent_interaction", {
+    taskId: response.taskId,
+    requestId: response.requestId,
+    kind: response.kind,
+    result: response.result,
   });
 }

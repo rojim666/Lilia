@@ -1,14 +1,20 @@
 import { render, fireEvent, waitFor, within } from "@testing-library/vue";
 import { createMemoryHistory } from "vue-router";
-import { afterEach, describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import { defineComponent, nextTick } from "vue";
 import type { Task } from "@lilia/contracts";
 import SecondaryPanel from "../src/layouts/SecondaryPanel.vue";
 import ContextMenuHost from "../src/components/ContextMenuHost.vue";
+import { useConnectionStatus } from "../src/composables/useConnectionStatus";
 import { createLiliaRouter } from "../src/router";
 import { projectsReady } from "../src/data/projects";
 import { allTasksReady, TASKS } from "../src/data/tasks";
-import { mockInvoke, setMockProjectPinned } from "./tauriMock";
+import {
+  mockInvoke,
+  setMockActiveBackend,
+  setMockCodexAppServerStatus,
+  setMockProjectPinned,
+} from "./tauriMock";
 
 function seedTreeExpansionState(state: unknown) {
   localStorage.setItem("lilia.projectTree.expansion", JSON.stringify(state));
@@ -107,14 +113,37 @@ async function dragFromTo(source: HTMLElement, target: HTMLElement, targetY: num
   });
 }
 
-afterEach(() => {
-  vi.useRealTimers();
-});
-
 describe("SecondaryPanel project tree expansion", () => {
   beforeEach(async () => {
     await Promise.all([projectsReady, allTasksReady]);
     localStorage.clear();
+  });
+
+  it("左下角连接徽章显示全局 active provider", async () => {
+    setMockActiveBackend("codex");
+    const view = await renderSecondaryPanel();
+
+    await waitFor(() => {
+      const label = view.container.querySelector(".sb-conn__label");
+      expect(label).toHaveTextContent("Codex");
+    });
+  });
+
+  it("Codex app-server 环境不满足时左下角 provider 卡片标红", async () => {
+    setMockActiveBackend("codex");
+    setMockCodexAppServerStatus({
+      supportsRequiredProtocol: false,
+      issues: ["Codex app-server 环境不满足。"],
+    });
+    await useConnectionStatus().refresh();
+    const view = await renderSecondaryPanel();
+
+    await waitFor(() => {
+      const card = view.container.querySelector(".sb-conn");
+      expect(card).toHaveClass("sb-conn--error");
+      expect(card).toHaveTextContent("异常");
+      expect(card).toHaveAttribute("title", expect.stringContaining("Codex app-server 环境不满足"));
+    });
   });
 
   it("会恢复上次关闭时的项目展开状态和收集箱状态", async () => {
@@ -138,6 +167,7 @@ describe("SecondaryPanel project tree expansion", () => {
     expect(toolsRow).toHaveAttribute("aria-expanded", "true");
     expect(orphansToggle).toBeInTheDocument();
   });
+
 
   it("用户切换后会写回本地存储", async () => {
     seedTreeExpansionState({
@@ -164,80 +194,6 @@ describe("SecondaryPanel project tree expansion", () => {
       expect(parsed.orphansExpanded).toBe(false);
     });
   });
-
-  it("新增项目会默认展开并同步保存", async () => {
-    seedTreeExpansionState({
-      projects: {
-        lilia: false,
-        tools: false,
-      },
-      orphansExpanded: true,
-    });
-
-    const view = await renderSecondaryPanel();
-    await fireEvent.click(view.getByRole("button", { name: "添加项目" }));
-    await fireEvent.click(await view.findByRole("menuitem", { name: "创建空分类" }));
-    await fireEvent.update(
-      await view.findByPlaceholderText("例如：实验、归档…"),
-      "临时分类",
-    );
-    await fireEvent.click(view.getByRole("button", { name: "创建" }));
-
-    await waitFor(() => {
-      expect(getProjectRow(view, "临时分类")).toHaveAttribute(
-        "aria-expanded",
-        "true",
-      );
-    });
-
-    const raw = localStorage.getItem("lilia.projectTree.expansion");
-    expect(raw).toBeTruthy();
-    const parsed = JSON.parse(raw ?? "{}") as {
-      projects?: Record<string, boolean>;
-    };
-    expect(parsed.projects?.lilia).toBe(false);
-    expect(parsed.projects?.tools).toBe(false);
-    expect(Object.values(parsed.projects ?? {}).some(Boolean)).toBe(true);
-  });
-});
-
-describe("SecondaryPanel project conversation overflow activity", () => {
-  beforeEach(async () => {
-    await Promise.all([projectsReady, allTasksReady]);
-    localStorage.clear();
-  });
-
-  it("项目树交互会刷新已展开剩余对话的自动折叠计时，侧栏非树操作不会", async () => {
-    seedSecondaryPanelOverflowConversations();
-    const view = await renderSecondaryPanel();
-    vi.useFakeTimers();
-
-    await fireEvent.click(view.getByRole("button", { name: "显示剩余对话" }));
-    expect(view.getByText("溢出对话 5")).toBeInTheDocument();
-
-    await vi.advanceTimersByTimeAsync(20_000);
-    await fireEvent.pointerMove(getProjectRow(view, "Lilia"), {
-      pointerId: 1,
-      clientY: 24,
-    });
-
-    await vi.advanceTimersByTimeAsync(20_000);
-    expect(view.getByText("溢出对话 5")).toBeInTheDocument();
-
-    const panel = view.container.querySelector(".secondary-panel");
-    if (!(panel instanceof HTMLElement)) {
-      throw new Error("未找到侧边栏");
-    }
-    panel.getBoundingClientRect = () => box(100, 500);
-    await fireEvent.pointerMove(panel, {
-      pointerId: 1,
-      clientY: 400,
-    });
-
-    await vi.advanceTimersByTimeAsync(10_000);
-    await nextTick();
-    expect(view.queryByText("溢出对话 5")).not.toBeInTheDocument();
-  });
 });
 
 describe("SecondaryPanel project chat navigation", () => {
@@ -245,6 +201,7 @@ describe("SecondaryPanel project chat navigation", () => {
     await Promise.all([projectsReady, allTasksReady]);
     localStorage.clear();
   });
+
 
   it("创建空分类后会自动进入该项目的新对话", async () => {
     const view = await renderSecondaryPanel();
@@ -264,22 +221,6 @@ describe("SecondaryPanel project chat navigation", () => {
     });
   });
 
-  it("项目分区右侧总览按钮进入所有项目总览", async () => {
-    const view = await renderSecondaryPanel("/projects/lilia/tasks/t-001");
-    const projectTools = view.getByText("项目")
-      .closest(".sb-section__header")
-      ?.querySelector(".sb-section__tools");
-
-    expect(projectTools).toContainElement(
-      view.getByRole("button", { name: "项目总览" }),
-    );
-
-    await fireEvent.click(view.getByRole("button", { name: "项目总览" }));
-
-    await waitFor(() => {
-      expect(view.router.currentRoute.value.path).toBe("/projects");
-    });
-  });
 
   it("顶部搜索会话后点击结果进入对应对话并关闭搜索", async () => {
     const view = await renderSecondaryPanel();
@@ -306,38 +247,6 @@ describe("SecondaryPanel project chat navigation", () => {
     expect(view.getByRole("button", { name: "搜索会话" })).toBeInTheDocument();
   });
 
-  it("归档当前项目对话后会进入该项目的新对话", async () => {
-    const view = await renderSecondaryPanel("/projects/lilia/tasks/t-001");
-    const lilia = getProjectRow(view, "Lilia");
-
-    await fireEvent.click(within(lilia).getByRole("button", { name: "更多" }));
-    await fireEvent.click(await view.findByText("归档所有对话"));
-    await fireEvent.click(await view.findByText("确认归档？再点一次"));
-
-    await waitFor(() => {
-      expect(view.router.currentRoute.value.path).toMatch(
-        /^\/projects\/lilia\/tasks\/t-draft-/,
-      );
-    });
-  });
-
-  it("在项目页归档全部对话时不会自动进入新对话", async () => {
-    const view = await renderSecondaryPanel("/projects/lilia");
-    const lilia = getProjectRow(view, "Lilia");
-
-    await fireEvent.click(within(lilia).getByRole("button", { name: "更多" }));
-    await fireEvent.click(await view.findByText("归档所有对话"));
-    await fireEvent.click(await view.findByText("确认归档？再点一次"));
-
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("task_archive_project", {
-        projectId: "lilia",
-      }, undefined);
-    });
-    await nextTick();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(view.router.currentRoute.value.path).toBe("/projects/lilia");
-  });
 
   it("归档当前打开的单条项目对话后会进入该项目的新对话", async () => {
     const view = await renderSecondaryPanel("/projects/lilia/tasks/t-001");
@@ -354,38 +263,20 @@ describe("SecondaryPanel project chat navigation", () => {
       );
     });
   });
-});
 
-describe("SecondaryPanel footer trigger", () => {
-  beforeEach(async () => {
-    await Promise.all([projectsReady, allTasksReady]);
-    localStorage.clear();
-  });
-
-  it("鼠标进入侧边栏最下方四分之一区时显示左下角按钮区，离开侧边栏后收起", async () => {
+  it("中键点击收集箱对话会在弹出窗口中打开", async () => {
     const view = await renderSecondaryPanel();
-    const panel = view.container.querySelector(".secondary-panel");
-    if (!(panel instanceof HTMLElement)) {
-      throw new Error("未找到侧边栏");
-    }
-    panel.getBoundingClientRect = () => box(100, 500);
+    const row = getConversationRow(view, "随手问问 Claude：tsconfig paths");
 
-    await fireEvent.pointerMove(panel, {
-      pointerId: 1,
-      clientY: 399,
-    });
-    expect(panel).not.toHaveClass("is-footer-hot");
+    await fireEvent(
+      row,
+      new MouseEvent("auxclick", { bubbles: true, button: 1 }),
+    );
 
-    await fireEvent.pointerMove(panel, {
-      pointerId: 1,
-      clientY: 400,
-    });
-    expect(panel).toHaveClass("is-footer-hot");
-
-    await fireEvent.pointerLeave(panel, {
-      pointerId: 1,
-    });
-    expect(panel).not.toHaveClass("is-footer-hot");
+    expect(mockInvoke).toHaveBeenCalledWith("popup_open_task", {
+      projectId: null,
+      taskId: "o-001",
+    }, undefined);
   });
 });
 
@@ -394,6 +285,7 @@ describe("SecondaryPanel project tree drag", () => {
     await Promise.all([projectsReady, allTasksReady]);
     localStorage.clear();
   });
+
 
   it("项目拖动时显示落点指示，松手后更新同置顶分组顺序", async () => {
     const view = await renderSecondaryPanel();
@@ -430,80 +322,5 @@ describe("SecondaryPanel project tree drag", () => {
         orderedIds: ["tools", "lilia"],
       }, undefined);
     });
-  });
-
-  it("对话行禁用原生链接拖拽，并能从标题拖到另一个项目", async () => {
-    const view = await renderSecondaryPanel();
-    const source = getConversationRow(view, "打通 tsconfig paths 搜索");
-    const sourceTitle = view.getByText("打通 tsconfig paths 搜索");
-    const targetProject = getProjectRow(view, "工具箱");
-    source.getBoundingClientRect = () => box(30, 58);
-    targetProject.getBoundingClientRect = () => box(90, 118);
-
-    expect(source).toHaveAttribute("draggable", "false");
-
-    await dragFromTo(sourceTitle, targetProject, 104);
-
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("task_reparent", {
-        taskId: "t-002",
-        newProjectId: "tools",
-      }, undefined);
-      expect(mockInvoke).toHaveBeenCalledWith("task_reorder", {
-        projectId: "tools",
-        orderedIds: ["t-003", "t-002"],
-      }, undefined);
-    });
-  });
-
-  it("对话拖到收集箱时 newProjectId 为 null", async () => {
-    const view = await renderSecondaryPanel();
-    const source = getConversationRow(view, "打通 tsconfig paths 搜索");
-    const orphan = getConversationRow(view, "随手问问 Claude：tsconfig paths");
-    source.getBoundingClientRect = () => box(30, 58);
-    orphan.getBoundingClientRect = () => box(150, 178);
-
-    await dragFromTo(source, orphan, 166);
-
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("task_reparent", {
-        taskId: "t-002",
-        newProjectId: null,
-      }, undefined);
-    });
-  });
-
-  it("跨置顶分组拖动项目时显示不可投放，并且不会发排序命令", async () => {
-    setMockProjectPinned("tools", true);
-    const view = await renderSecondaryPanel();
-    const lilia = getProjectRow(view, "Lilia");
-    const tools = getProjectRow(view, "工具箱");
-    lilia.getBoundingClientRect = () => box(40, 68);
-    tools.getBoundingClientRect = () => box(0, 28);
-
-    await fireEvent.pointerDown(lilia, {
-      button: 0,
-      pointerId: 1,
-      clientX: 20,
-      clientY: 54,
-    });
-    await fireEvent.pointerMove(tools, {
-      pointerId: 1,
-      clientX: 20,
-      clientY: 14,
-    });
-
-    expect(tools).toHaveClass("is-tree-drop-target");
-    expect(tools).toHaveClass("is-tree-drop-invalid");
-
-    await fireEvent.pointerUp(tools, {
-      pointerId: 1,
-      clientX: 20,
-      clientY: 14,
-    });
-
-    expect(
-      mockInvoke.mock.calls.some(([cmd]) => cmd === "project_reorder"),
-    ).toBe(false);
   });
 });

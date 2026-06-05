@@ -8,6 +8,12 @@
 export {
   listTasks,
   getTask,
+  ensureTaskLoaded,
+  ensureAllProjectTasksLoaded,
+  ensureOrphansLoaded,
+  ensureProjectTasksLoaded,
+  areOrphansLoaded,
+  isProjectTasksLoaded,
   listProjectConversations,
   archiveProjectConversations,
   archiveTask,
@@ -17,6 +23,7 @@ export {
   promoteDraftTask,
   reorderTasks,
   reparentTask,
+  resolveConversationRouteState,
 } from "../data/tasks";
 
 export {
