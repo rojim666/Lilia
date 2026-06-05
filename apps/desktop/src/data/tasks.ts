@@ -300,6 +300,7 @@ export async function promoteDraftTask(id: string, title: string): Promise<void>
       [draft.projectId]: [task, ...existing],
     };
   }
+  await refresh();
 }
 
 export async function archiveTask(taskId: string): Promise<boolean> {
@@ -311,10 +312,12 @@ export async function archiveTask(taskId: string): Promise<boolean> {
       const next = [...list];
       next.splice(idx, 1);
       TASKS.value = { ...TASKS.value, [pid]: next };
+      await refresh();
       return true;
     }
   }
   ORPHAN_LIST.value = ORPHAN_LIST.value.filter((o) => o.id !== taskId);
+  await refresh();
   return true;
 }
 
@@ -330,6 +333,7 @@ export async function archiveProjectConversations(projectId: string): Promise<nu
       draftCleared += 1;
     }
   }
+  await refresh();
   return dbCount + draftCleared;
 }
 
